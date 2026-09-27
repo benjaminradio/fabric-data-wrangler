@@ -1,0 +1,7 @@
+region,rep,product,units,unit_price
+east,alice,widget,10,4.50
+east,alice,gadget,3,12.00
+east,bob,widget,7,4.50
+west,carol,widget,5,4.75
+west,carol,gadget,,12.00
+west,dave,gizmo,2,25.00
