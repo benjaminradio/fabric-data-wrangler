@@ -113,8 +113,13 @@ jobs:
           # "install_only" note above) and ships the shared
           # library/DLL alongside the binary, the same way any program
           # ships its runtime dependencies -- DW_PYLIB below is that file.
+          # The "install_only" flavor extracts to a flat
+          # python/{bin,lib,include,share} layout with no "install/"
+          # middle directory (unlike the old "full" flavor's nested
+          # python/{build,install}/... layout) -- so these patterns must
+          # not require "install/" anywhere in the path.
           if [ "$RUNNER_OS" = "Windows" ]; then
-            IMPORT_LIB=$(find pbs -ipath '*/install/libs/python3[0-9][0-9].lib' | head -n1)
+            IMPORT_LIB=$(find pbs -ipath '*/libs/python3[0-9][0-9].lib' | head -n1)
             DW_PYLIB=$(find pbs -iname 'python3[0-9][0-9].dll' | grep -vi '/venv/' | head -n1)
             # Exclude the venv module's own bundled launcher stub
             # (Lib/venv/scripts/nt/python.exe) -- not the real interpreter.
@@ -122,7 +127,8 @@ jobs:
           else
             IMPORT_LIB=$(find pbs -name 'libpython3.*.so*' | sort | head -n1)
             DW_PYLIB="$IMPORT_LIB"
-            PYEXE=$(find pbs -type f -path '*/install/bin/python3.*' | grep -v config | head -n1)
+            PYEXE=$(find pbs -type f -path '*/bin/python3.*' | grep -v config || true)
+            PYEXE=$(echo "$PYEXE" | head -n1)
           fi
 
           if [ -z "$IMPORT_LIB" ]; then
