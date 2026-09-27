@@ -93,6 +93,13 @@ jobs:
           fi
           chmod +x "$PYEXE"
 
+          # Must be absolute: pyo3-build-config emits these paths verbatim
+          # into cargo:rustc-link-search / the executable path it shells
+          # out to, and a relative path here does not reliably resolve
+          # against the crate's build directory.
+          STATIC_LIB=$(realpath "$STATIC_LIB")
+          PYEXE=$(realpath "$PYEXE")
+
           LIB_DIR=$(dirname "$STATIC_LIB")
           LIB_FILE=$(basename "$STATIC_LIB")
           LIB_NAME=${LIB_FILE#lib}
