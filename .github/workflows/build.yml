@@ -140,6 +140,23 @@ jobs:
           fi
           PYVER=$("$PYEXE" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
 
+          # pyo3-build-config's file is parsed by a native Rust build
+          # script, which (on Windows) needs real Windows paths -- Git
+          # Bash's own `realpath` above produces its MSYS/POSIX form
+          # (e.g. /d/a/repo/repo), which Windows APIs cannot resolve (that
+          # is genuinely what broke here: "could not find native static
+          # library python311" the first time this ran, because lib_dir
+          # was an MSYS path). $GITHUB_WORKSPACE itself is already a
+          # native path, so config_path below doesn't need this, but
+          # lib_dir/executable (derived from `realpath`) do.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            CFG_LIB_DIR=$(cygpath -w "$LIB_DIR")
+            CFG_EXECUTABLE=$(cygpath -w "$PYEXE")
+          else
+            CFG_LIB_DIR="$LIB_DIR"
+            CFG_EXECUTABLE="$PYEXE"
+          fi
+
           CONFIG_PATH="$GITHUB_WORKSPACE/pyo3-build-config.txt"
           cat > "$CONFIG_PATH" <<EOF
           implementation=CPython
@@ -147,8 +164,8 @@ jobs:
           shared=false
           abi3=false
           lib_name=$LIB_NAME
-          lib_dir=$LIB_DIR
-          executable=$PYEXE
+          lib_dir=$CFG_LIB_DIR
+          executable=$CFG_EXECUTABLE
           pointer_width=64
           build_flags=
           suppress_build_script_link_lines=false
@@ -176,7 +193,14 @@ jobs:
           {
             echo "extra_static_libs=$(IFS=,; echo "${EXTRA_LIBS[*]}")"
             echo "extra_static_lib_dirs<<EOF_DIRS"
-            for d in "${EXTRA_DIRS[@]:-}"; do [ -n "$d" ] && realpath "$d"; done
+            for d in "${EXTRA_DIRS[@]:-}"; do
+              [ -z "$d" ] && continue
+              d=$(realpath "$d")
+              # Also consumed by a native Rust build script (crates/cli/build.rs
+              # -> cargo:rustc-link-search) -- same MSYS-path problem as above.
+              [ "$RUNNER_OS" = "Windows" ] && d=$(cygpath -w "$d")
+              echo "$d"
+            done
             echo "EOF_DIRS"
           } >> "$GITHUB_OUTPUT"
 
