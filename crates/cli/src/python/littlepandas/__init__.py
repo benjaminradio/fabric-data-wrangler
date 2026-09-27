@@ -10,18 +10,22 @@ two-line diff, not a silent swap of what an unqualified ``import pandas``
 means:
 
 1. ``import littlepandas as pd`` becomes ``import pandas as pd``.
-2. ``df = pd.DataFrame()`` (see below) becomes ``df = pd.DataFrame(<real
-   data source>)``, e.g. a lakehouse read.
+2. ``df = pd.read_input()`` (see below) becomes whatever real ingestion
+   call fits Fabric (a lakehouse read, ``pd.read_csv``, ...).
 
-**``pd.DataFrame()`` with no arguments pulls in the CLI's ingested input
-data.** This is intentional, and intentionally not how real pandas
-behaves (``pandas.DataFrame()`` with no arguments makes an empty frame) --
-seeing a bare ``pd.DataFrame()`` in a script is a deliberate, visible flag
-that says "this line is local-only and needs a real data source before it
-will do anything in Fabric," exactly the kind of thing you want to be
-unable to miss when porting. The Rust host sets the module-level
-``_INGESTED_DATA`` below after loading the CLI's ``--input`` file and
-before running the script.
+``pd.DataFrame(...)`` behaves like real pandas: called with no arguments it
+makes an empty frame, and it accepts either a list of row dicts
+(``[{"a": 1}, {"a": 2}]``) or a dict of columns
+(``{"Name": ["Alice", "Bob"], "Age": [25, 30]}``), for building small
+literal tables directly in a script.
+
+**``pd.read_input()`` reads the CLI's ingested ``--input`` file**, named
+to match pandas' own ``read_csv``/``read_excel``/etc. family. It only
+exists here -- there's no equivalent to strip out when porting, just a
+line to replace with a real read. The Rust host sets the module-level
+``_INGESTED_DATA`` below after loading ``--input`` and before running the
+script; ``read_input()`` is a thin wrapper (`DataFrame(_INGESTED_DATA)`)
+around it.
 
 Known compatibility gap (the big one): this DataFrame has no real pandas
 Index. Operations that in real pandas move something into (or read
@@ -35,12 +39,23 @@ avoid depending on index alignment.
 
 from itertools import groupby as _itertools_groupby
 
-__all__ = ["DataFrame", "Series", "concat"]
+__all__ = ["DataFrame", "Series", "concat", "read_input"]
 
 # Set by the Rust host (crates/cli/src/python_runtime.rs) after loading
-# --input and before running the transformation script. `pd.DataFrame()`
-# with no arguments reads from here -- see the module docstring above.
+# --input and before running the transformation script. `read_input()`
+# reads from here -- see the module docstring above.
 _INGESTED_DATA = None
+
+
+def read_input():
+    """Return the CLI's ingested ``--input`` data as a DataFrame.
+
+    Named to match pandas' ``read_csv``/``read_excel``/etc. family. Unlike
+    those, this has no real-pandas equivalent to fall back to -- porting to
+    Fabric means replacing this call with whatever real ingestion fits
+    there (a lakehouse read, ``pd.read_csv``, ...).
+    """
+    return DataFrame(_INGESTED_DATA if _INGESTED_DATA is not None else [])
 
 
 def _is_missing(v):
@@ -141,6 +156,23 @@ class Series:
     def fillna(self, value):
         return Series([value if _is_missing(v) else v for v in self._values], self.name)
 
+    def ffill(self):
+        result = []
+        last = None
+        for v in self._values:
+            last = v if not _is_missing(v) else last
+            result.append(last)
+        return Series(result, self.name)
+
+    def bfill(self):
+        result = [None] * len(self._values)
+        nxt = None
+        for i in range(len(self._values) - 1, -1, -1):
+            v = self._values[i]
+            nxt = v if not _is_missing(v) else nxt
+            result[i] = nxt
+        return Series(result, self.name)
+
     def _numeric(self):
         return [v for v in self._values if not _is_missing(v)]
 
@@ -181,11 +213,16 @@ class DataFrame:
 
     def __init__(self, data=None, columns=None):
         if data is None:
-            # No arguments: pull in the CLI's ingested --input data. Real
-            # pandas would give you an empty frame here instead -- see the
-            # module docstring.
-            data = _INGESTED_DATA if _INGESTED_DATA is not None else []
-        rows = list(data)
+            rows = []
+        elif isinstance(data, dict):
+            # Dict of columns, e.g. {"Name": ["Alice", "Bob"], "Age": [25, 30]}.
+            col_names = list(data.keys())
+            length = len(next(iter(data.values()))) if data else 0
+            rows = [{c: data[c][i] for c in col_names} for i in range(length)]
+            if columns is None:
+                columns = col_names
+        else:
+            rows = list(data)
         if columns is not None:
             self._columns = list(columns)
         else:
@@ -319,6 +356,28 @@ class DataFrame:
         rows = [row for row in self._rows if all(not _is_missing(row.get(c)) for c in cols)]
         return DataFrame._from_rows(rows, list(self._columns))
 
+    def ffill(self):
+        rows = [dict(row) for row in self._rows]
+        last = {c: None for c in self._columns}
+        for row in rows:
+            for c in self._columns:
+                if _is_missing(row.get(c)):
+                    row[c] = last[c]
+                else:
+                    last[c] = row[c]
+        return DataFrame._from_rows(rows, list(self._columns))
+
+    def bfill(self):
+        rows = [dict(row) for row in self._rows]
+        nxt = {c: None for c in self._columns}
+        for row in reversed(rows):
+            for c in self._columns:
+                if _is_missing(row.get(c)):
+                    row[c] = nxt[c]
+                else:
+                    nxt[c] = row[c]
+        return DataFrame._from_rows(rows, list(self._columns))
+
     def astype(self, spec):
         if not isinstance(spec, dict):
             raise NotImplementedError("astype only supports a {column: type} mapping")
@@ -335,6 +394,72 @@ class DataFrame:
         if axis != 1:
             raise NotImplementedError("apply only supports axis=1 (row-wise)")
         return Series([fn(row) for row in self._rows])
+
+    def map(self, fn):
+        """Apply ``fn`` elementwise to every cell (mirrors ``DataFrame.map``,
+        the modern replacement for the deprecated ``applymap``). Missing
+        values are left as-is, consistent with ``Series.map`` above.
+        """
+        rows = [
+            {k: (fn(v) if not _is_missing(v) else v) for k, v in row.items()}
+            for row in self._rows
+        ]
+        return DataFrame._from_rows(rows, list(self._columns))
+
+    def pop(self, column):
+        """Remove ``column`` and return it as a Series, mutating this
+        DataFrame in place -- matches real pandas' ``DataFrame.pop``.
+        """
+        series = Series([row.get(column) for row in self._rows], name=column)
+        for row in self._rows:
+            row.pop(column, None)
+        self._columns.remove(column)
+        return series
+
+    def _row_mask(self, cond):
+        if isinstance(cond, Series):
+            return cond.tolist()
+        if callable(cond):
+            return [bool(cond(row)) for row in self._rows]
+        raise TypeError(f"unsupported condition for where()/mask(): {cond!r}")
+
+    def where(self, cond, other=None):
+        """Keep a row's values where ``cond`` is true, else replace the
+        whole row with ``other`` (broadcast, or a callable(row) -> value per
+        column). ``cond`` is a boolean Series (one value per row, as from a
+        column comparison) or a callable(row) -> bool -- this drop-in has no
+        per-cell/whole-frame elementwise comparison, unlike real pandas'
+        ``df.where(df > 0)``.
+        """
+        keep = self._row_mask(cond)
+        rows = [
+            dict(row) if k else {c: other for c in self._columns}
+            for row, k in zip(self._rows, keep)
+        ]
+        return DataFrame._from_rows(rows, list(self._columns))
+
+    def mask(self, cond, other=None):
+        """Inverse of ``where``: replace a row with ``other`` where ``cond``
+        is true, keep it otherwise.
+        """
+        keep = self._row_mask(cond)
+        rows = [
+            {c: other for c in self._columns} if k else dict(row)
+            for row, k in zip(self._rows, keep)
+        ]
+        return DataFrame._from_rows(rows, list(self._columns))
+
+    def assign(self, **kwargs):
+        """Return a copy with columns added/overwritten. Each keyword's
+        value is either a callable taking this DataFrame (evaluated against
+        the frame *as assembled so far*, so later assignments can reference
+        earlier ones, as in real pandas) or a scalar/list/Series assigned
+        directly.
+        """
+        result = self.copy()
+        for name, value in kwargs.items():
+            result[name] = value(result) if callable(value) else value
+        return result
 
     def groupby(self, by, as_index=True):
         return GroupBy(self, by)

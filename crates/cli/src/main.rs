@@ -8,11 +8,11 @@ use dw_ingest::OutputFormat;
 use python_runtime::OutputTarget;
 
 /// Local, offline data-wrangling CLI. Runs a Python transformation script,
-/// written like a Fabric notebook cell (`df = pd.DataFrame()`, ...,
+/// written like a Fabric notebook cell (`df = pd.read_input()`, ...,
 /// `display(df)`), against a CSV/XLSX input file -- locally, with no
 /// pandas/numpy dependency. Porting to a real Fabric notebook is a small,
 /// visible two-line diff: `import littlepandas as pd` becomes `import
-/// pandas as pd`, and `pd.DataFrame()` gets a real data source.
+/// pandas as pd`, and `pd.read_input()` becomes a real ingestion call.
 #[derive(Parser, Debug)]
 #[command(name = "dw", version, about)]
 struct Args {
@@ -22,7 +22,7 @@ struct Args {
 
     /// Python transformation script. Sees `display` as a global, plus
     /// `import littlepandas as pd` resolving to the pure-Python drop-in,
-    /// whose `pd.DataFrame()` (no arguments) reads the ingested records.
+    /// whose `pd.read_input()` reads the ingested records.
     #[arg(short, long)]
     script: PathBuf,
 

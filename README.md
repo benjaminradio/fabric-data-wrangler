@@ -2,7 +2,7 @@
 
 Offline CLI for wrangling small CSV/XLSX datasets (< ~10k rows) with plain
 Python transformation scripts that look like a Fabric notebook cell —
-`import littlepandas as pd`, `df = pd.DataFrame()`, ..., `display(df)`.
+`import littlepandas as pd`, `df = pd.read_input()`, ..., `display(df)`.
 
 ```
 dw --input data.csv --script transform.py --output out.csv
@@ -13,7 +13,7 @@ dw --input data.csv --script transform.py --output out.csv
 ```python
 import littlepandas as pd
 
-df = pd.DataFrame()
+df = pd.read_input()
 df = df[df["units"].notna()]
 summary = df.groupby("region", as_index=False).agg(total=("units", "sum"))
 display(summary)
@@ -28,12 +28,12 @@ This project ships a small, pure-Python DataFrame drop-in
 (`crates/cli/src/python/littlepandas/__init__.py`) so transformation
 scripts can be written in pandas-shaped code without needing real
 pandas/numpy embedded (see "Why no real pandas/numpy locally" below). An
-earlier version of this project installed that drop-in *as* `sys.modules["pandas"]`,
-so `import pandas as pd` resolved to it locally and to the real thing in
-Fabric, with no script changes at all. That's tidy, but it hides something
-important: a script's `import pandas` would silently mean two completely
-different libraries depending on where it runs, with no visible marker of
-that fact in the code itself.
+earlier version of this project installed that drop-in *as*
+`sys.modules["pandas"]`, so `import pandas as pd` resolved to it locally
+and to the real thing in Fabric, with no script changes at all. That's
+tidy, but it hides something important: a script's `import pandas` would
+silently mean two completely different libraries depending on where it
+runs, with no visible marker of that fact in the code itself.
 
 So the drop-in is named, and installed as, `littlepandas` instead — `import
 littlepandas as pd` only ever resolves locally. Porting a script to a real
@@ -41,27 +41,27 @@ Fabric notebook is consequently a small, *visible* two-line diff rather
 than a silent swap:
 
 1. `import littlepandas as pd` → `import pandas as pd`.
-2. `df = pd.DataFrame()` → `df = pd.DataFrame(<real data source>)`, e.g. a
-   lakehouse table read.
+2. `df = pd.read_input()` → whatever real ingestion fits Fabric (a
+   lakehouse table read, `pd.read_csv`, ...).
 
-**`pd.DataFrame()` with no arguments pulls in the CLI's `--input` data.**
-This is deliberate and deliberately not how real pandas behaves: calling
-`pandas.DataFrame()` with no arguments doesn't error, but it does give you
-a genuinely empty frame (verified — the resulting `display()` prints an
-empty table, not a crash), so a bare `pd.DataFrame()` left unported into
-Fabric fails loudly-ish (empty output) rather than silently doing the
-right thing. That's the point: it's a visible flag for "this line needs a
-real data source before it means anything outside this CLI," which you
-want to be unable to miss.
+`pd.DataFrame(...)` itself behaves exactly like real pandas: called with no
+arguments it makes an empty frame, and it accepts either a list of row
+dicts or a dict of columns (`pd.DataFrame({"Name": ["Alice", "Bob"], "Age":
+[25, 30]})`) for literal tables written directly in a script — no special
+local-only behavior there. **`pd.read_input()`, not `DataFrame`, is the
+local-only call**, named to match pandas' own `read_csv`/`read_excel`/etc.
+family: it reads the CLI's ingested `--input` file. Unlike `DataFrame`,
+`read_input()` has no real-pandas meaning to fall back to — it's a visible
+line marking "replace this with a real data source," not a silent stand-in
+for one.
 
 ## How the cut-and-paste contract works
 
-- **`littlepandas.DataFrame()`** — the Rust host ingests `--input`
+- **`littlepandas.read_input()`** — the Rust host ingests `--input`
   host-side (`csv`/`calamine` crates, no Python involved) and, before
   running the script, sets it on the `littlepandas` module as
-  `_INGESTED_DATA`. `DataFrame()` called with no arguments reads from
-  there; called with an explicit argument (`pd.DataFrame(some_list)`) it
-  behaves like an ordinary constructor, same as real pandas.
+  `_INGESTED_DATA`. `read_input()` is a thin wrapper returning
+  `DataFrame(_INGESTED_DATA)`.
 - **`display(df)`** — a native Rust function that writes the DataFrame's
   rows (via `.to_dict(orient="records")`, called on whatever is passed —
   a real pandas DataFrame included) to CSV/XLSX/NDJSON/table, to stdout or
@@ -86,9 +86,12 @@ want to be unable to miss.
      temp file.
 - **`crates/cli/src/python/littlepandas/__init__.py`** — the pure-Python
   DataFrame/Series/GroupBy drop-in, built incrementally as real
-  transformation scripts need more of it. Currently covers: column
+  transformation scripts need more of it. Currently covers: construction
+  from a list of row dicts or a dict of columns, column
   selection/assignment, boolean-mask filtering (`df[df["x"] > 5]`),
-  `rename`, `sort_values`, `fillna`, `dropna`, `astype`, `apply(axis=1)`,
+  `rename`, `sort_values`, `fillna`/`dropna`, `ffill`/`bfill`, `pop`,
+  `where`/`mask` (row-wise condition, not full elementwise), `assign`,
+  `astype`, `map` (elementwise) and `apply(axis=1)` (row-wise),
   `groupby(...).agg(...)` using pandas' named-aggregation tuple shorthand
   (`total=("col", "sum")`) plus `.sum()`/`.mean()`/`.count()`/`.size()`,
   `merge` (inner/left, `on` or `left_on`/`right_on`, suffix handling),
@@ -129,6 +132,13 @@ and it's missing a real **Index**. Concretely:
   `apply(axis=0)`, no `pivot_table` (aggregating pivot — only the plain,
   non-aggregating `pivot` exists). Add them here as real scripts need them
   — see the drop-in's module docstring.
+- `where`/`mask` take a row-wise condition (a boolean Series, one value per
+  row, or a `callable(row) -> bool`) and replace or keep the *whole row*
+  accordingly — matching real pandas' behavior for that specific case
+  (`df.where(series_cond, other)`, verified against a real installation),
+  but not real pandas' more general per-cell/whole-frame elementwise
+  `df.where(df > 0, 0)`, since this drop-in has no DataFrame-wide
+  elementwise comparison operators to build a per-cell condition from.
 
 ## Building and running
 

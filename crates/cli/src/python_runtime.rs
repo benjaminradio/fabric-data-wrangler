@@ -4,7 +4,7 @@
 //! ```python
 //! import littlepandas as pd
 //!
-//! df = pd.DataFrame()
+//! df = pd.read_input()
 //! ...
 //! display(df)
 //! ```
@@ -17,9 +17,12 @@
 //! `pandas` -- it isn't pandas, and hiding that behind an identical import
 //! would make a script's actual data source invisible. Porting to Fabric
 //! is a small, visible two-line diff instead: the import name, and
-//! `pd.DataFrame()` (which pulls in `--input` locally -- see
+//! `pd.read_input()` (which reads `--input` locally -- see
 //! `_INGESTED_DATA` below and the module's own docstring) becoming
-//! `pd.DataFrame(<real data source>)`.
+//! whatever real ingestion call fits Fabric. `pd.DataFrame(...)` itself
+//! behaves like real pandas (empty with no arguments, accepts a list of
+//! row dicts or a dict of columns) -- it's `read_input()`, not
+//! `DataFrame`, that only exists locally.
 //!
 //! **No disk writes for embedding Python.** The `littlepandas` drop-in's
 //! source is compiled into the binary at build time via `include_str!` and
@@ -271,10 +274,10 @@ fn sibling_python_runtime_dir() -> Option<PathBuf> {
     candidate.is_dir().then_some(candidate)
 }
 
-/// Make `records` available to `littlepandas.DataFrame()` (no arguments)
-/// via `_INGESTED_DATA`, then run the user's transformation script as
-/// top-level code (like a notebook cell): it builds a DataFrame, transforms
-/// it, and calls `display(df)` zero or more times to produce output.
+/// Make `records` available to `littlepandas.read_input()` via
+/// `_INGESTED_DATA`, then run the user's transformation script as top-level
+/// code (like a notebook cell): it reads the data, transforms it, and calls
+/// `display(df)` zero or more times to produce output.
 pub fn run_script(
     script_path: &Path,
     records: Vec<Record>,
