@@ -1,0 +1,429 @@
+"""Pure-Python drop-in for the tiny slice of the pandas API this project
+uses, built incrementally as real transformation scripts need more of it.
+
+This module is installed as ``sys.modules["pandas"]`` by the Rust host, so
+a script's ``import pandas as pd`` resolves here locally. In a Fabric
+notebook, the real pandas package is already installed, so the exact same
+``import pandas as pd`` line resolves to the genuine library instead --
+nothing about the transformation code needs to change. That import line is
+the entire portability contract.
+
+Known compatibility gap (the big one): this DataFrame has no real pandas
+Index. Operations that in real pandas move something into (or read
+something out of) the index -- e.g. ``groupby(...)`` without
+``as_index=False``, or relying on a preserved row index after filtering --
+behave here as if ``as_index=False`` were always in effect, and
+``reset_index()`` is a no-op. Scripts that need to run unmodified on real
+pandas too should pass ``as_index=False`` explicitly to ``groupby`` and
+avoid depending on index alignment.
+"""
+
+from itertools import groupby as _itertools_groupby
+
+__all__ = ["DataFrame", "Series"]
+
+
+def _is_missing(v):
+    return v is None
+
+
+class Series:
+    """A single named column: a list of values plus elementwise ops."""
+
+    def __init__(self, values, name=None):
+        self._values = list(values)
+        self.name = name
+
+    def __len__(self):
+        return len(self._values)
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __getitem__(self, i):
+        return self._values[i]
+
+    def tolist(self):
+        return list(self._values)
+
+    def _binop(self, other, fn):
+        if isinstance(other, Series):
+            other_values = other._values
+        elif isinstance(other, (list, tuple)):
+            other_values = other
+        else:
+            other_values = [other] * len(self._values)
+        return Series([fn(a, b) for a, b in zip(self._values, other_values)])
+
+    def _cmp(self, other, fn):
+        return self._binop(other, fn)
+
+    def __eq__(self, other):
+        return self._cmp(other, lambda a, b: a == b)
+
+    def __ne__(self, other):
+        return self._cmp(other, lambda a, b: a != b)
+
+    def __lt__(self, other):
+        return self._cmp(other, lambda a, b: a < b)
+
+    def __le__(self, other):
+        return self._cmp(other, lambda a, b: a <= b)
+
+    def __gt__(self, other):
+        return self._cmp(other, lambda a, b: a > b)
+
+    def __ge__(self, other):
+        return self._cmp(other, lambda a, b: a >= b)
+
+    def __add__(self, other):
+        return self._binop(other, lambda a, b: a + b)
+
+    def __radd__(self, other):
+        return self._binop(other, lambda a, b: b + a)
+
+    def __sub__(self, other):
+        return self._binop(other, lambda a, b: a - b)
+
+    def __rsub__(self, other):
+        return self._binop(other, lambda a, b: b - a)
+
+    def __mul__(self, other):
+        return self._binop(other, lambda a, b: a * b)
+
+    def __rmul__(self, other):
+        return self._binop(other, lambda a, b: b * a)
+
+    def __truediv__(self, other):
+        return self._binop(other, lambda a, b: a / b)
+
+    def __and__(self, other):
+        return self._binop(other, lambda a, b: bool(a) and bool(b))
+
+    def __or__(self, other):
+        return self._binop(other, lambda a, b: bool(a) or bool(b))
+
+    def __invert__(self):
+        return Series([not bool(v) for v in self._values])
+
+    def isna(self):
+        return Series([_is_missing(v) for v in self._values])
+
+    def notna(self):
+        return Series([not _is_missing(v) for v in self._values])
+
+    def map(self, fn):
+        return Series([fn(v) if not _is_missing(v) else v for v in self._values], self.name)
+
+    def astype(self, to):
+        return Series([to(v) if not _is_missing(v) else v for v in self._values], self.name)
+
+    def fillna(self, value):
+        return Series([value if _is_missing(v) else v for v in self._values], self.name)
+
+    def _numeric(self):
+        return [v for v in self._values if not _is_missing(v)]
+
+    def sum(self):
+        return sum(self._numeric())
+
+    def mean(self):
+        vals = self._numeric()
+        return sum(vals) / len(vals) if vals else None
+
+    def min(self):
+        vals = self._numeric()
+        return min(vals) if vals else None
+
+    def max(self):
+        vals = self._numeric()
+        return max(vals) if vals else None
+
+    def count(self):
+        return len(self._numeric())
+
+    def nunique(self):
+        return len({v for v in self._numeric()})
+
+    def unique(self):
+        seen = []
+        for v in self._values:
+            if v not in seen:
+                seen.append(v)
+        return seen
+
+    def __repr__(self):
+        return f"Series({self._values!r})"
+
+
+class DataFrame:
+    """Row-oriented (``list[dict]``) drop-in for the pandas DataFrame surface used here."""
+
+    def __init__(self, data=None, columns=None):
+        rows = list(data) if data is not None else []
+        if columns is not None:
+            self._columns = list(columns)
+        else:
+            self._columns = []
+            for row in rows:
+                for k in row.keys():
+                    if k not in self._columns:
+                        self._columns.append(k)
+        self._rows = [dict(row) for row in rows]
+
+    # -- construction / conversion -----------------------------------
+    @classmethod
+    def _from_rows(cls, rows, columns=None):
+        df = cls.__new__(cls)
+        df._rows = rows
+        df._columns = list(columns) if columns is not None else (
+            list(rows[0].keys()) if rows else []
+        )
+        return df
+
+    def copy(self):
+        return DataFrame._from_rows([dict(r) for r in self._rows], list(self._columns))
+
+    def to_dict(self, orient="records"):
+        if orient != "records":
+            raise NotImplementedError("only orient='records' is supported")
+        return [dict(row) for row in self._rows]
+
+    def reset_index(self, drop=True):
+        # No Index is modeled; this is a no-op that returns a copy, matching
+        # the effect of `reset_index(drop=True)` on an as_index=False frame.
+        return self.copy()
+
+    # -- shape ----------------------------------------------------------
+    def __len__(self):
+        return len(self._rows)
+
+    @property
+    def shape(self):
+        return (len(self._rows), len(self._columns))
+
+    @property
+    def columns(self):
+        return list(self._columns)
+
+    @columns.setter
+    def columns(self, new_columns):
+        new_columns = list(new_columns)
+        renamed = []
+        for row in self._rows:
+            renamed.append({new: row.get(old) for old, new in zip(self._columns, new_columns)})
+        self._rows = renamed
+        self._columns = new_columns
+
+    # -- indexing ---------------------------------------------------------
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return Series([row.get(key) for row in self._rows], name=key)
+        if isinstance(key, (list, tuple)) and all(isinstance(k, str) for k in key):
+            columns = list(key)
+            rows = [{c: row.get(c) for c in columns} for row in self._rows]
+            return DataFrame._from_rows(rows, columns)
+        if isinstance(key, Series):
+            mask = key.tolist()
+            rows = [row for row, keep in zip(self._rows, mask) if keep]
+            return DataFrame._from_rows(rows, list(self._columns))
+        raise TypeError(f"unsupported indexer: {key!r}")
+
+    def __setitem__(self, key, value):
+        if isinstance(value, Series):
+            values = value.tolist()
+        elif isinstance(value, (list, tuple)):
+            values = list(value)
+        else:
+            values = [value] * len(self._rows)
+        if len(values) != len(self._rows):
+            raise ValueError("length mismatch assigning column")
+        for row, v in zip(self._rows, values):
+            row[key] = v
+        if key not in self._columns:
+            self._columns.append(key)
+
+    def __repr__(self):
+        return f"DataFrame({self._rows!r})"
+
+    # -- verbs -------------------------------------------------------------
+    def rename(self, columns=None):
+        columns = columns or {}
+        rows = [
+            {columns.get(k, k): v for k, v in row.items()} for row in self._rows
+        ]
+        new_cols = [columns.get(c, c) for c in self._columns]
+        return DataFrame._from_rows(rows, new_cols)
+
+    def sort_values(self, by, ascending=True):
+        keys = [by] if isinstance(by, str) else list(by)
+        rows = sorted(self._rows, key=lambda r: tuple(r.get(k) for k in keys), reverse=not ascending)
+        return DataFrame._from_rows(rows, list(self._columns))
+
+    def drop_duplicates(self, subset=None, keep="first"):
+        seen = set()
+        rows = []
+        source = self._rows if keep == "first" else list(reversed(self._rows))
+        for row in source:
+            key = tuple(row.get(c) for c in subset) if subset else tuple(sorted(row.items()))
+            if key not in seen:
+                seen.add(key)
+                rows.append(row)
+        if keep != "first":
+            rows.reverse()
+        return DataFrame._from_rows(rows, list(self._columns))
+
+    def fillna(self, value):
+        if isinstance(value, dict):
+            rows = []
+            for row in self._rows:
+                new_row = dict(row)
+                for col, v in value.items():
+                    if _is_missing(new_row.get(col)):
+                        new_row[col] = v
+                rows.append(new_row)
+        else:
+            rows = [
+                {k: (value if _is_missing(v) else v) for k, v in row.items()}
+                for row in self._rows
+            ]
+        return DataFrame._from_rows(rows, list(self._columns))
+
+    def dropna(self, subset=None):
+        cols = subset if subset is not None else self._columns
+        rows = [row for row in self._rows if all(not _is_missing(row.get(c)) for c in cols)]
+        return DataFrame._from_rows(rows, list(self._columns))
+
+    def astype(self, spec):
+        if not isinstance(spec, dict):
+            raise NotImplementedError("astype only supports a {column: type} mapping")
+        rows = []
+        for row in self._rows:
+            new_row = dict(row)
+            for col, to in spec.items():
+                if not _is_missing(new_row.get(col)):
+                    new_row[col] = to(new_row[col])
+            rows.append(new_row)
+        return DataFrame._from_rows(rows, list(self._columns))
+
+    def apply(self, fn, axis=1):
+        if axis != 1:
+            raise NotImplementedError("apply only supports axis=1 (row-wise)")
+        return Series([fn(row) for row in self._rows])
+
+    def groupby(self, by, as_index=True):
+        return GroupBy(self, by)
+
+    def merge(self, right, on=None, left_on=None, right_on=None, how="inner", suffixes=("_x", "_y")):
+        if on is not None:
+            left_key = right_key = on
+        else:
+            left_key, right_key = left_on, right_on
+
+        right_index = {}
+        for row in right._rows:
+            right_index.setdefault(row.get(right_key), []).append(row)
+
+        left_suffix, right_suffix = suffixes
+        shared = (set(self._columns) & set(right._columns)) - {left_key if on else None, right_key if on else None}
+
+        right_value_columns = [c for c in right._columns if not (on is not None and c == right_key)]
+
+        rows = []
+        for left_row in self._rows:
+            matches = right_index.get(left_row.get(left_key), [])
+            if matches:
+                for right_row in matches:
+                    merged = {}
+                    for k, v in left_row.items():
+                        merged[f"{k}{left_suffix}" if k in shared else k] = v
+                    for k, v in right_row.items():
+                        if on is not None and k == right_key:
+                            continue
+                        merged[f"{k}{right_suffix}" if k in shared else k] = v
+                    rows.append(merged)
+            elif how == "left":
+                merged = dict(left_row)
+                for k in right_value_columns:
+                    merged[f"{k}{right_suffix}" if k in shared else k] = None
+                rows.append(merged)
+        return DataFrame._from_rows(rows)
+
+    def head(self, n=5):
+        return DataFrame._from_rows(list(self._rows[:n]), list(self._columns))
+
+    def tail(self, n=5):
+        return DataFrame._from_rows(list(self._rows[-n:]) if n else [], list(self._columns))
+
+
+_AGG_FUNCS = {
+    "sum": lambda values: sum(values),
+    "mean": lambda values: sum(values) / len(values) if values else None,
+    "min": lambda values: min(values) if values else None,
+    "max": lambda values: max(values) if values else None,
+    "count": lambda values: len(values),
+    "nunique": lambda values: len(set(values)),
+    "list": lambda values: list(values),
+}
+
+
+class GroupBy:
+    """Minimal groupby supporting pandas' named-aggregation ``.agg()`` shorthand.
+
+    No Index is modeled -- results always come back with the group-by
+    columns as regular columns (equivalent to real pandas' ``as_index=False``),
+    regardless of what ``as_index`` was passed to ``groupby()``.
+    """
+
+    def __init__(self, df, by):
+        self._df = df
+        self._keys = [by] if isinstance(by, str) else list(by)
+
+    def _groups(self):
+        rows = sorted(self._df._rows, key=lambda r: tuple(r.get(k) for k in self._keys))
+        for key_values, group_iter in _itertools_groupby(
+            rows, key=lambda r: tuple(r.get(k) for k in self._keys)
+        ):
+            yield key_values, list(group_iter)
+
+    def agg(self, **aggregations):
+        result_rows = []
+        for key_values, group in self._groups():
+            out_row = dict(zip(self._keys, key_values))
+            for out_name, spec in aggregations.items():
+                source_column, agg = spec
+                values = [row.get(source_column) for row in group]
+                fn = _AGG_FUNCS[agg] if isinstance(agg, str) else agg
+                out_row[out_name] = fn(values)
+            result_rows.append(out_row)
+        return DataFrame._from_rows(result_rows)
+
+    def _reduce_all_columns(self, fn):
+        result_rows = []
+        for key_values, group in self._groups():
+            out_row = dict(zip(self._keys, key_values))
+            other_columns = [c for c in self._df._columns if c not in self._keys]
+            for c in other_columns:
+                values = [row.get(c) for row in group if not _is_missing(row.get(c))]
+                try:
+                    out_row[c] = fn(values)
+                except TypeError:
+                    continue
+            result_rows.append(out_row)
+        return DataFrame._from_rows(result_rows)
+
+    def sum(self):
+        return self._reduce_all_columns(sum)
+
+    def mean(self):
+        return self._reduce_all_columns(lambda vs: sum(vs) / len(vs) if vs else None)
+
+    def count(self):
+        return self._reduce_all_columns(len)
+
+    def size(self):
+        rows = [
+            {**dict(zip(self._keys, key_values)), "size": len(group)}
+            for key_values, group in self._groups()
+        ]
+        return DataFrame._from_rows(rows)

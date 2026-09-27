@@ -1,22 +1,23 @@
-"""Example transformation script.
+"""Example transformation script -- looks like a Fabric notebook cell.
 
-Runs unmodified against the local `wrangle` drop-in and, later, a Fabric
-notebook's pandas/PySpark-backed `wrangle` adapter -- only the import
-resolution differs, never this code.
+Cut-and-paste unmodified into a Fabric notebook: there, `data` would come
+from your own ingestion cell (e.g. a lakehouse table read into a list of
+rows/dicts) and `import pandas as pd` resolves to real pandas instead of
+this project's pure-Python drop-in. `display()` is likewise already a
+Fabric notebook built-in.
 """
 
-import wrangle
+import pandas as pd
 
+df = pd.DataFrame(data)
+df["units"] = df["units"].fillna(0)
+df = df.astype({"units": int})
+df["revenue"] = df["units"] * df["unit_price"]
 
-def transform(records):
-    rows = wrangle.fillna(records, 0, columns=["units"])
-    rows = wrangle.cast(rows, "units", int)
-    rows = wrangle.mutate(rows, revenue=lambda r: r["units"] * r["unit_price"])
+summary = df.groupby(["region", "rep"], as_index=False).agg(
+    total_units=("units", "sum"),
+    total_revenue=("revenue", "sum"),
+)
+summary = summary.sort_values("total_revenue", ascending=False)
 
-    summary = wrangle.group_by(
-        rows,
-        by=["region", "rep"],
-        total_units=("units", "sum"),
-        total_revenue=("revenue", "sum"),
-    )
-    return wrangle.sort_by(summary, "total_revenue", reverse=True)
+display(summary)

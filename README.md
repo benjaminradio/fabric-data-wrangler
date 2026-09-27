@@ -1,25 +1,52 @@
 # dw — local data-wrangling CLI
 
 Offline CLI for wrangling small CSV/XLSX datasets (< ~10k rows) with plain
-Python transformation scripts, without pandas/numpy, designed so the same
-transformation code runs unmodified later in a Microsoft Fabric notebook.
+Python transformation scripts written exactly like a Fabric notebook cell —
+`import pandas as pd`, `df = pd.DataFrame(data)`, ..., `display(df)` — so the
+same script cuts and pastes unmodified into a real Fabric notebook later.
 
 ```
 dw --input data.csv --script transform.py --output out.csv
 ```
 
-`transform.py` defines a single entry point:
+`transform.py`:
 
 ```python
-import wrangle
+import pandas as pd
 
-def transform(records):
-    rows = wrangle.filter_rows(records, lambda r: r["units"] is not None)
-    return wrangle.group_by(rows, by="region", total=("units", "sum"))
+df = pd.DataFrame(data)
+df = df[df["units"].notna()]
+summary = df.groupby("region", as_index=False).agg(total=("units", "sum"))
+display(summary)
 ```
 
-`records` is a plain `list[dict]`. See `examples/transform_example.py` and
-`examples/sample.csv` for a working example.
+See `examples/transform_example.py` and `examples/sample.csv` for a working
+example.
+
+## How the cut-and-paste contract works
+
+A script like the one above needs exactly two things to exist that it
+didn't create itself: a `data` variable and a `display()` function. Those
+are exactly what a Fabric notebook already gives you — an earlier cell
+populates `data` (e.g. from a lakehouse read), and `display()` is a Fabric
+built-in. Locally, the `dw` CLI supplies both:
+
+- **`data`** — the input CSV/XLSX, ingested host-side in Rust (`csv` /
+  `calamine` crates, no Python involved) and injected as a global: a plain
+  `list[dict]`, exactly the shape `pd.DataFrame(data)` expects and exactly
+  the shape you'd get back from most Fabric ingestion paths too.
+- **`import pandas as pd`** — resolves to this project's pure-Python
+  drop-in (`crates/cli/src/python/pandas/__init__.py`), installed into
+  `sys.modules["pandas"]` before the script runs. In a Fabric notebook, real
+  pandas is already installed, so the identical import line resolves to the
+  genuine library instead. **This one line is the entire portability
+  contract** — nothing else in the script needs an adapter or a different
+  import path.
+- **`display(df)`** — locally, a native Rust function writes the
+  DataFrame's rows (via `.to_dict(orient="records")`, called on whatever is
+  passed — real pandas DataFrames included) to CSV/XLSX/NDJSON/table, to
+  stdout or `--output`. In Fabric, `display()` renders the DataFrame in the
+  notebook instead; the call is a no-op difference either way.
 
 ## Architecture
 
@@ -28,32 +55,25 @@ def transform(records):
   and consumes plain `Vec<IndexMap<String, serde_json::Value>>` records.
 - **`crates/cli`** — the `dw` binary. Parses arguments (`clap`), embeds a
   Python interpreter (`pyo3`), and:
-  1. Installs the `wrangle` package into `sys.modules` directly from
-     `include_str!`-embedded source (`crates/cli/src/python/wrangle/*.py`) —
-     no temp-directory extraction, no files shipped beside the binary.
-  2. Reads the user's `.py` transform script from disk (a legitimate input
-     file) and compiles it in memory via `PyModule::from_code`.
-  3. Converts records to/from Python via `pythonize`, calls `transform(records)`.
-- **`wrangle` package** (`crates/cli/src/python/wrangle/`):
-  - `_local.py` — the pure-Python drop-in verb library: `select`, `rename`,
-    `filter_rows`, `sort_by`, `mutate`, `group_by` (with per-column `agg`),
-    `join` (inner/left), `dedupe`, `fillna`, `cast`, `head`, `tail`. Plain
-    functions over `list[dict]`, no classes, no third-party dependencies —
-    only this needs to load from memory with zero disk writes.
-  - `_fabric.py` — a pandas-backed adapter exposing the *identical*
-    function signatures, accepting and returning the same `list[dict]`
-    shape, so calling code is byte-for-byte identical either way.
-  - `__init__.py` — the portability shim. Autodetects environment
-    (`notebookutils`/`pyspark` importable ⇒ Fabric; else local), or honors
-    `WRANGLE_BACKEND=local|fabric` to force one, and re-exports the chosen
-    backend's verbs as `wrangle.*`. **This is the whole portability
-    contract**: a transformation script only ever does `import wrangle` and
-    calls verbs on it; nothing else differs between local and Fabric.
+  1. Installs the `pandas` drop-in into `sys.modules` directly from
+     `include_str!`-embedded source — no temp-directory extraction, no
+     files shipped beside the binary.
+  2. Sets `data` (the ingested records, converted via `pythonize`) and a
+     native `display()` closure as globals.
+  3. Reads the user's `.py` script from disk (a legitimate input file) and
+     runs it as top-level code via `Python::run_bound` — never written to a
+     temp file.
+- **`crates/cli/src/python/pandas/__init__.py`** — the pure-Python
+  DataFrame/Series/GroupBy drop-in, built incrementally as real
+  transformation scripts need more of it. Currently covers: column
+  selection/assignment, boolean-mask filtering (`df[df["x"] > 5]`),
+  `rename`, `sort_values`, `fillna`, `dropna`, `astype`, `apply(axis=1)`,
+  `groupby(...).agg(...)` using pandas' named-aggregation tuple shorthand
+  (`total=("col", "sum")`) plus `.sum()`/`.mean()`/`.count()`/`.size()`,
+  `merge` (inner/left, `on` or `left_on`/`right_on`, suffix handling),
+  `drop_duplicates`, `head`/`tail`, `to_dict(orient="records")`.
 
-Both backends were verified side by side against the same input (see
-"What was verified" below) and produce identical output shape.
-
-## Why no pandas/numpy
+## Why no real pandas/numpy locally
 
 See the original design doc for the full argument; in short: CPython's
 in-memory resource loading (the mechanism this project relies on for
@@ -62,10 +82,47 @@ not compiled `.so`/`.pyd` extension modules, which must `dlopen` from a real
 path on a real filesystem. pandas and numpy ship as dozens of such compiled
 extensions; there is no supported way to make third-party wheels like these
 built-in/statically-linked without hand-maintaining a fork against a
-fast-moving upstream. So all local transformation logic runs on pure-Python
-`list[dict]` records instead, and the pandas dependency is pushed entirely
-into the Fabric-side adapter, where a real pandas/PySpark install already
-exists.
+fast-moving upstream. So the local drop-in runs on plain `list[dict]`
+records instead, mirroring only the pandas surface area actually used.
+
+## Known compatibility gaps
+
+This is a subset of pandas, not a reimplementation, and it's missing a real
+**Index**. Concretely:
+
+- `groupby(...)` results always come back with the group-by columns as
+  regular columns, as if `as_index=False` were always passed. **Always pass
+  `as_index=False` explicitly** in scripts that must also run unmodified on
+  real pandas, or the two will disagree once you skip `reset_index()`.
+- `reset_index()` is a no-op (returns a copy) — fine given the above, but
+  it means this drop-in can't catch a script relying on real index
+  semantics elsewhere.
+- `NaN` vs `None`: missing values are plain `None` here, not `float('nan')`
+  (`unit_price` etc. read from CSV as blank become `None`). Comparisons
+  and `.fillna()`/`.dropna()` treat `None` as the missing marker
+  consistently, but code that specifically checks `math.isnan(x)` will not
+  behave the same locally as on real pandas.
+- No `.loc`/`.iloc`, no multi-index, no non-`records` `to_dict` orients, no
+  `apply(axis=0)`. Add them here as real scripts need them — see the
+  drop-in's module docstring.
+
+## Building and running
+
+```
+cargo build --release
+./target/release/dw --input examples/sample.csv --script examples/transform_example.py
+```
+
+Requires a Python 3 development install on the build machine for now (see
+"Spike status" below) — e.g. `python3-dev`/`python3-config` on Debian/Ubuntu.
+
+### Output formats
+
+`--format csv|xlsx|ndjson|table`, or inferred from `--output`'s extension.
+`--output -` (the default) streams to stdout as a table. Each `display()`
+call in the script writes immediately: multiple calls each print their own
+block to stdout, or overwrite the same `--output` file in turn (last call
+wins).
 
 ## Spike status — what was verified here vs. what remains
 
@@ -73,27 +130,23 @@ This environment's outbound network access is restricted to a small
 allow-list (crates.io, pypi.org, npm, a few others) and does **not** include
 `github.com`, which is where `python-build-standalone` distributions are
 published as release assets. That specific download was not reachable from
-here, so the final swap described below could not be built or run in this
-session. Everything else in the design was implemented and exercised:
+here, so the final interpreter swap described below could not be built or
+run in this session. Everything else was implemented and exercised:
 
 **Verified in this sandbox:**
 - The Rust workspace builds cleanly (`cargo build --workspace`, zero warnings).
-- End-to-end pipeline: CSV → embedded Python (`wrangle` + user script) →
-  CSV/NDJSON/table/XLSX output, and XLSX → ... → table, all produce correct
-  results (see `examples/`).
-- The `wrangle` package's own loading mechanism — `include_str!` source
+- End-to-end: CSV/XLSX input → embedded Python (`data` + `pd` drop-in +
+  `display()`) → CSV/NDJSON/table/XLSX output, all correct (see `examples/`).
+- **Cut-and-paste fidelity**: `examples/transform_example.py` was run
+  byte-for-byte unmodified (only substituting a real-pandas-backed `data`
+  loader and a trivial `display()` shim in place of the CLI's injected
+  globals) against a real, installed pandas and produced identical output
+  to the local drop-in run — confirming the portability contract actually
+  holds for that script.
+- The `pandas` drop-in's own loading mechanism — `include_str!` source
   compiled and installed into `sys.modules` directly, no filesystem
-  extraction — works exactly as designed. This is the piece the design doc
-  flagged as needing `oxidized_importer`/`OxidizedFinder`-style memory
-  loading; the manual `sys.modules` injection here achieves the same
-  zero-disk-write property for our own resources without depending on that
-  crate at all. It will keep working unchanged after the interpreter swap
-  below, since it doesn't touch the interpreter's own bootstrap.
-- Both `wrangle` backends (`_local` pure-Python, `_fabric` pandas-backed,
-  the latter tested with a real `pandas` install) were run against the same
-  fixture data through the public API and produce identical results.
-- User transformation scripts are compiled straight from an in-memory
-  string (`PyModule::from_code`) — never written to a temp file.
+  extraction — works as designed and is independent of the interpreter
+  swap below.
 
 **Not yet done — the interpreter itself:**
 `dw` currently embeds Python via `pyo3`'s `auto-initialize` feature, which
@@ -112,55 +165,18 @@ The follow-up spike this design doc calls for is still open: fetch a
 `PYO3_PYTHON`/`PYO3_CONFIG_FILE` at its statically-linked `libpython`, and
 replace `auto-initialize` linking with that config so the final binary has
 no external Python dependency. Loading the *stdlib itself* purely from
-memory (rather than from the distribution's on-disk layout) additionally
-needs the `oxidized-importer` crate (the standalone, non-PyOxidizer-tool
-crate published under that name) wired in as a `sys.meta_path` finder over
-the distribution's packed resources data — this is exactly the
-`OxidizedFinder`/`oxidized_importer` mechanism the design doc identifies as
-the relevant building block, decoupled from needing the full PyOxidizer
-build tool. Neither of these needed anything from this codebase's structure
-to change; they replace `Python::with_gil`'s initialization path in
-`crates/cli/src/python_runtime.rs` only.
-
-## Building and running
-
-```
-cargo build --release
-./target/release/dw --input examples/sample.csv --script examples/transform_example.py
-```
-
-Requires a Python 3 development install on the build machine for now (see
-"Spike status" above) — e.g. `python3-dev`/`python3-config` on Debian/Ubuntu.
-
-### Output formats
-
-`--format csv|xlsx|ndjson|table`, or inferred from `--output`'s extension.
-`--output -` (the default) streams to stdout as a table.
-
-## Fabric portability
-
-To validate the adapter without a real Fabric workspace:
-
-```
-pip install pandas
-WRANGLE_BACKEND=fabric python3 -c "
-import sys; sys.path.insert(0, 'crates/cli/src/python')
-import wrangle
-print(wrangle.group_by([{'r':'e','v':1},{'r':'e','v':2}], 'r', total=('v','sum')))
-"
-```
-
-In an actual Fabric notebook, ship `wrangle/__init__.py` and `_fabric.py`
-(not `_local.py`) as a notebook-attached library or workspace package; the
-autodetection (`notebookutils`/`pyspark` present) picks `_fabric`
-automatically, so no code changes are needed in the transformation scripts
-themselves — only the deployment/import step, per the "same code, adapter
-shim" strategy.
+memory additionally needs the `oxidized-importer` crate (the standalone,
+non-PyOxidizer-tool crate published under that name) wired in as a
+`sys.meta_path` finder over the distribution's packed resources data.
+Neither of these needs anything in this codebase's structure to change;
+they replace `Python::with_gil`'s initialization path in
+`crates/cli/src/python_runtime.rs` only — the `data`/`pandas`/`display`
+injection mechanism stays exactly as-is.
 
 ## What's deliberately out of scope for v1
 
 - Zip-of-modules transformation input (single `.py` file only).
-- A fixed/complete verb API — verbs are added as real scripts need them
-  (see `wrangle/_local.py`'s docstring).
+- A complete pandas API surface — methods are added as real scripts need
+  them (see the drop-in's module docstring).
 - The `python-build-standalone`/`oxidized-importer` interpreter swap (see
   "Spike status").

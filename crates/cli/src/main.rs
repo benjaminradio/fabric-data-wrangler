@@ -5,10 +5,13 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 use dw_ingest::OutputFormat;
+use python_runtime::OutputTarget;
 
-/// Local, offline data-wrangling CLI. Runs a pure-Python transformation
-/// script (written against the `wrangle` drop-in library) against a CSV/XLSX
-/// input file, entirely locally, with no pandas/numpy dependency.
+/// Local, offline data-wrangling CLI. Runs a Python transformation script,
+/// written exactly like a Fabric notebook cell (`df = pd.DataFrame(data)`,
+/// ..., `display(df)`), against a CSV/XLSX input file -- locally, with no
+/// pandas/numpy dependency, but with the same script pasting unmodified
+/// into a real Fabric notebook later.
 #[derive(Parser, Debug)]
 #[command(name = "dw", version, about)]
 struct Args {
@@ -16,11 +19,13 @@ struct Args {
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Python transformation script defining a top-level `transform(records)` function
+    /// Python transformation script. Sees `data` (the ingested records) and
+    /// `display` as globals, plus `import pandas as pd` resolving to the
+    /// pure-Python drop-in.
     #[arg(short, long)]
     script: PathBuf,
 
-    /// Output path, or "-" for stdout (default)
+    /// Output path for display() calls, or "-" for stdout (default)
     #[arg(short, long, default_value = "-")]
     output: String,
 
@@ -36,28 +41,23 @@ fn main() -> Result<()> {
     let records = dw_ingest::read_records(&args.input)
         .with_context(|| format!("reading input {}", args.input.display()))?;
 
-    let transformed = python_runtime::run_transform(&args.script, records)
-        .with_context(|| format!("running transform script {}", args.script.display()))?;
-
-    let format = match &args.format {
-        Some(f) => OutputFormat::parse(f)?,
-        None if args.output == "-" => OutputFormat::Table,
-        None => OutputFormat::infer_from_path(&PathBuf::from(&args.output)),
+    let target = if args.output == "-" {
+        let format = match &args.format {
+            Some(f) => OutputFormat::parse(f)?,
+            None => OutputFormat::Table,
+        };
+        OutputTarget::Stdout(format)
+    } else {
+        let path = PathBuf::from(&args.output);
+        let format = match &args.format {
+            Some(f) => OutputFormat::parse(f)?,
+            None => OutputFormat::infer_from_path(&path),
+        };
+        OutputTarget::File(path, format)
     };
 
-    if args.output == "-" {
-        let stdout = std::io::stdout();
-        dw_ingest::write_records(&transformed, format, stdout.lock())?;
-    } else {
-        let out_path = PathBuf::from(&args.output);
-        if format == OutputFormat::Xlsx {
-            dw_ingest::write_xlsx(&transformed, &out_path)?;
-        } else {
-            let file = std::fs::File::create(&out_path)
-                .with_context(|| format!("creating output file {}", out_path.display()))?;
-            dw_ingest::write_records(&transformed, format, file)?;
-        }
-    }
+    python_runtime::run_script(&args.script, records, target)
+        .with_context(|| format!("running transform script {}", args.script.display()))?;
 
     Ok(())
 }
