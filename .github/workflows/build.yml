@@ -1,0 +1,164 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch: {}
+
+env:
+  # python-build-standalone release to pull from. "latest" resolves
+  # dynamically to whatever astral-sh/python-build-standalone most recently
+  # published; pin a specific tag (e.g. "20240814") here if you need
+  # reproducibility.
+  PBS_RELEASE_TAG: latest
+  PBS_PYTHON_SERIES: "3.11"
+  TARGET_TRIPLE: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Resolve python-build-standalone release
+        id: pbs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$PBS_RELEASE_TAG" = "latest" ]; then
+            release_json=$(gh api repos/astral-sh/python-build-standalone/releases/latest)
+          else
+            release_json=$(gh api "repos/astral-sh/python-build-standalone/releases/tags/$PBS_RELEASE_TAG")
+          fi
+
+          # Prefer an optimized "full" build (contains static libs + headers,
+          # not just the redistributable "install_only" runtime), for our
+          # exact Python series and target triple. Fall back from
+          # pgo+lto -> pgo -> lto -> plain if a given variant isn't published
+          # for this triple.
+          asset_url=""
+          for variant in "pgo+lto-full" "pgo-full" "lto-full" "full"; do
+            asset_url=$(echo "$release_json" | jq -r --arg series "cpython-$PBS_PYTHON_SERIES." --arg triple "$TARGET_TRIPLE" --arg variant "$variant" \
+              '.assets[] | select(.name | startswith($series)) | select(.name | contains($triple)) | select(.name | endswith($variant + ".tar.zst")) | .browser_download_url' \
+              | head -n1)
+            if [ -n "$asset_url" ]; then
+              echo "Selected variant: $variant"
+              break
+            fi
+          done
+
+          if [ -z "$asset_url" ]; then
+            echo "::error::No matching python-build-standalone asset found for series=$PBS_PYTHON_SERIES triple=$TARGET_TRIPLE"
+            echo "$release_json" | jq -r '.assets[].name'
+            exit 1
+          fi
+
+          echo "asset_url=$asset_url" >> "$GITHUB_OUTPUT"
+          echo "Resolved asset: $asset_url"
+
+      - name: Download and extract python-build-standalone
+        run: |
+          set -euo pipefail
+          mkdir -p pbs
+          curl -sSL "${{ steps.pbs.outputs.asset_url }}" -o pbs.tar.zst
+          tar --zstd -xf pbs.tar.zst -C pbs
+          find pbs -maxdepth 2
+
+      - name: Generate pyo3 static-link config
+        id: pyo3cfg
+        run: |
+          set -euo pipefail
+          STATIC_LIB=$(find pbs -name 'libpython3.*.a' | head -n1)
+          PYEXE=$(find pbs -type f -path '*/install/bin/python3.*' | grep -v config | head -n1)
+
+          if [ -z "$STATIC_LIB" ]; then
+            echo "::error::No static libpython*.a found in the downloaded distribution"
+            find pbs -name 'libpython*'
+            exit 1
+          fi
+          if [ -z "$PYEXE" ]; then
+            echo "::error::No python3 executable found under */install/bin in the downloaded distribution"
+            exit 1
+          fi
+          chmod +x "$PYEXE"
+
+          LIB_DIR=$(dirname "$STATIC_LIB")
+          LIB_FILE=$(basename "$STATIC_LIB")
+          LIB_NAME=${LIB_FILE#lib}
+          LIB_NAME=${LIB_NAME%.a}
+          PYVER=$("$PYEXE" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+
+          CONFIG_PATH="$GITHUB_WORKSPACE/pyo3-build-config.txt"
+          cat > "$CONFIG_PATH" <<EOF
+          implementation=CPython
+          version=$PYVER
+          shared=false
+          abi3=false
+          lib_name=$LIB_NAME
+          lib_dir=$LIB_DIR
+          executable=$PYEXE
+          pointer_width=64
+          build_flags=
+          suppress_build_script_link_lines=false
+          EOF
+
+          echo "---- pyo3-build-config.txt ----"
+          cat "$CONFIG_PATH"
+
+          echo "config_path=$CONFIG_PATH" >> "$GITHUB_OUTPUT"
+
+          # PYTHONHOME must point at the install *prefix* (containing
+          # bin/, lib/pythonX.Y/, etc.), not directly at lib/.
+          INSTALL_PREFIX=$(dirname "$(dirname "$PYEXE")")
+          echo "install_prefix=$INSTALL_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "pyver=$PYVER" >> "$GITHUB_OUTPUT"
+
+      - name: Build (statically linked libpython)
+        env:
+          PYO3_CONFIG_FILE: ${{ steps.pyo3cfg.outputs.config_path }}
+        run: cargo build --release --workspace
+
+      - name: Verify libpython is not a dynamic dependency
+        run: |
+          set -euo pipefail
+          echo "---- ldd target/release/dw ----"
+          ldd target/release/dw || true
+          if ldd target/release/dw | grep -qi python; then
+            echo "::error::dw still dynamically links against libpython; static linking did not take effect"
+            exit 1
+          fi
+          echo "OK: no dynamic libpython dependency"
+
+      - name: Package the runtime bundle (binary + stdlib sibling dir)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/dw dist/dw
+          cp -r "${{ steps.pyo3cfg.outputs.install_prefix }}" dist/python-runtime
+
+      - name: Smoke test (system PYTHONHOME/PYTHONPATH cleared)
+        run: |
+          set -euo pipefail
+          env -u PYTHONHOME -u PYTHONPATH \
+            ./dist/dw --input examples/sample.csv --script examples/transform_example.py
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          tar -C dist -czf dw-${{ env.TARGET_TRIPLE }}.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dw-${{ env.TARGET_TRIPLE }}
+          path: dw-${{ env.TARGET_TRIPLE }}.tar.gz

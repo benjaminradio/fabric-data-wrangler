@@ -25,16 +25,26 @@
 //! from the in-memory string via `Python::run_bound` -- again, no
 //! intermediate file.
 //!
-//! What this does NOT yet do (see README "Spike status"): the interpreter
-//! itself is linked against the *system* libpython (via pyo3's
-//! `auto-initialize`, which shells out to `python3-config`), not a
-//! statically-linked `python-build-standalone` distribution with its
-//! stdlib loaded through an `oxidized-importer`-style in-memory finder.
-//! That swap is the next step and needs network access to fetch a
-//! `python-build-standalone` release, which this development environment
-//! did not have. The in-memory module loading here is exactly the
-//! mechanism that continues to work once that swap happens -- only the
-//! interpreter's own bootstrap changes, not this code.
+//! **Interpreter linking.** `pyo3`'s build script (`pyo3-build-config`)
+//! decides which libpython to link against from `PYO3_CONFIG_FILE` (or
+//! `PYO3_PYTHON`, or a `python3` found on `PATH`) at *build* time -- no
+//! code here changes between a system-Python dev build and a CI build
+//! statically linked against a `python-build-standalone` distribution. See
+//! `.github/workflows/build.yml`, which downloads a `python-build-standalone`
+//! release, points `PYO3_CONFIG_FILE` at its static `libpython*.a`, and
+//! verifies with `ldd` that the resulting binary has no dynamic dependency
+//! on libpython. A local `cargo build` without that env var still falls
+//! back to the system's libpython via `auto-initialize`, for convenience.
+//!
+//! **Stdlib location.** Even with libpython statically linked, the pure-Python
+//! standard library (`.py`/`.pyc` files) still needs to be found on disk at
+//! run time, since this project doesn't yet wire up an `oxidized-importer`-style
+//! in-memory finder for it (see README "Spike status" for that remaining
+//! step). `configure_python_home` below points `PYTHONHOME` at a
+//! `python-runtime/` directory shipped as a sibling of the executable, if
+//! one is present -- that's what the CI workflow packages alongside `dw`,
+//! so the released bundle needs no system Python install, even though it's
+//! a binary-plus-directory bundle rather than a single file today.
 
 use std::path::{Path, PathBuf};
 
@@ -120,6 +130,31 @@ fn make_display_fn<'py>(
     )
 }
 
+/// Point `PYTHONHOME` at a shipped runtime, if one is available, before the
+/// interpreter initializes. Precedence: an already-set `PYTHONHOME` wins
+/// (never override an explicit choice), then `DW_PYTHON_HOME`, then a
+/// `python-runtime/` directory sitting next to the current executable (what
+/// the CI-built bundle ships). If none of these apply, Python falls back to
+/// whatever its own build-time defaults are (the system install, for a
+/// locally built dev binary).
+fn configure_python_home() {
+    if std::env::var_os("PYTHONHOME").is_some() {
+        return;
+    }
+    let home = std::env::var_os("DW_PYTHON_HOME")
+        .map(PathBuf::from)
+        .or_else(sibling_python_runtime_dir);
+    if let Some(home) = home {
+        std::env::set_var("PYTHONHOME", home);
+    }
+}
+
+fn sibling_python_runtime_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.parent()?.join("python-runtime");
+    candidate.is_dir().then_some(candidate)
+}
+
 /// Read `records` in as the `data` global, then run the user's
 /// transformation script as top-level code (like a notebook cell): it
 /// builds a DataFrame from `data`, transforms it, and calls `display(df)`
@@ -131,6 +166,8 @@ pub fn run_script(
 ) -> Result<()> {
     let source = std::fs::read_to_string(script_path)
         .with_context(|| format!("reading transform script {}", script_path.display()))?;
+
+    configure_python_home();
 
     Python::with_gil(|py| -> Result<()> {
         install_pandas_dropin(py).map_err(|e| anyhow!("installing pandas drop-in: {e}"))?;
