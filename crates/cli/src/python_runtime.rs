@@ -36,16 +36,26 @@
 //! on libpython. A local `cargo build` without that env var still falls
 //! back to the system's libpython via `auto-initialize`, for convenience.
 //!
-//! **Stdlib location.** Even with libpython statically linked, the pure-Python
-//! standard library (`.py`/`.pyc` files) still needs to be found on disk at
-//! run time, since this project doesn't yet wire up an `oxidized-importer`-style
-//! in-memory finder for it (see README "Spike status" for that remaining
-//! step). `configure_python_home` below points `PYTHONHOME` at a
-//! `python-runtime/` directory shipped as a sibling of the executable, if
-//! one is present -- that's what the CI workflow packages alongside `dw`,
-//! so the released bundle needs no system Python install, even though it's
-//! a binary-plus-directory bundle rather than a single file today.
+//! **Stdlib, frozen into the binary.** Even with libpython statically
+//! linked, the pure-Python standard library (`.py` sources) still has to
+//! come from *somewhere* at run time. Rather than shipping those files on
+//! disk beside the binary, `.github/workflows/build.yml` runs
+//! `scripts/freeze_stdlib.py` (with the *same* interpreter whose libpython
+//! is linked in, so bytecode compatibility is guaranteed) to compile every
+//! stdlib module to marshalled bytecode, and `build.rs` embeds the result
+//! into the binary via `include_bytes!`. `install_frozen_stdlib` below
+//! registers those modules as CPython "frozen modules" -- the same
+//! mechanism CPython itself uses to embed `importlib._bootstrap` -- by
+//! prepending them to `PyImport_FrozenModules` before the interpreter
+//! initializes. `FrozenImporter` is always the first entry on
+//! `sys.meta_path`, so every one of these imports is satisfied before
+//! CPython (or a transformation script) ever consults the filesystem. A
+//! local dev build (system libpython, no frozen stdlib generated) leaves
+//! `FROZEN_STDLIB_ENTRIES` empty and this is a no-op, falling back to
+//! the system's normal on-disk stdlib.
 
+use std::ffi::CString;
+use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -55,6 +65,66 @@ use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 
 const PANDAS_DROPIN_PY: &str = include_str!("python/pandas/__init__.py");
+
+include!(concat!(env!("OUT_DIR"), "/frozen_stdlib_generated.rs"));
+
+/// Register the embedded stdlib bytecode as CPython frozen modules, on top
+/// of whatever frozen modules CPython's own build already provides
+/// (`importlib._bootstrap`, `zipimport`, ...). Must run before any
+/// interpreter initialization -- `PyImport_FrozenModules` is only consulted
+/// while the interpreter starts up.
+fn install_frozen_stdlib() {
+    if FROZEN_STDLIB_ENTRIES.is_empty() {
+        return;
+    }
+
+    let mut combined: Vec<pyo3::ffi::_frozen> = Vec::new();
+
+    // SAFETY: PyImport_FrozenModules is a plain C global CPython's own
+    // startup code (Modules/frozen.c) initializes independently of
+    // Py_Initialize, so reading it here (before we've touched the
+    // interpreter at all) observes CPython's own default frozen-module
+    // table, terminated by a null-name sentinel entry.
+    unsafe {
+        let mut existing = pyo3::ffi::PyImport_FrozenModules;
+        if !existing.is_null() {
+            while !(*existing).name.is_null() {
+                combined.push(*existing);
+                existing = existing.add(1);
+            }
+        }
+    }
+
+    for &(name, offset, size, is_package) in FROZEN_STDLIB_ENTRIES {
+        // Intentionally leaked: `_frozen.name` must stay valid for the life
+        // of the interpreter, and CPython does not take ownership of it.
+        let name_ptr = CString::new(name)
+            .expect("frozen module name has no interior NUL")
+            .into_raw() as *const c_char;
+        combined.push(pyo3::ffi::_frozen {
+            name: name_ptr,
+            code: FROZEN_STDLIB_BLOB[offset..offset + size].as_ptr(),
+            size: size as c_int,
+            is_package: is_package as c_int,
+            get_code: None,
+        });
+    }
+
+    combined.push(pyo3::ffi::_frozen {
+        name: std::ptr::null(),
+        code: std::ptr::null(),
+        size: 0,
+        is_package: 0,
+        get_code: None,
+    });
+
+    let leaked: &'static [pyo3::ffi::_frozen] = combined.leak();
+    // SAFETY: leaked has 'static lifetime and ends with a null-name
+    // sentinel, matching what CPython's frozen importer expects.
+    unsafe {
+        pyo3::ffi::PyImport_FrozenModules = leaked.as_ptr();
+    }
+}
 
 /// Where `display(df)` calls should write output. Every `display()` call
 /// writes immediately; writing to a file overwrites it each time (so with
@@ -130,23 +200,19 @@ fn make_display_fn<'py>(
     )
 }
 
-/// Point Python's home at a shipped runtime, if one is available, before the
-/// interpreter initializes. Precedence: an already-set `PYTHONHOME` wins
-/// (never override an explicit choice), then `DW_PYTHON_HOME`, then a
-/// `python-runtime/` directory sitting next to the current executable (what
-/// the CI-built bundle ships). If none of these apply, Python falls back to
-/// whatever its own build-time defaults are (the system install, for a
-/// locally built dev binary).
+/// Best-effort fallback only: with the stdlib frozen in (see
+/// `install_frozen_stdlib`), nothing on the happy path needs `PYTHONHOME` at
+/// all, since every stdlib import is satisfied before the filesystem is ever
+/// consulted. This only matters for a build with no frozen stdlib embedded
+/// (a local dev build against the system's dynamic libpython, which already
+/// has a real prefix baked in from its own build, so this is a no-op there
+/// too) or for locating an optional `python-runtime/` directory if someone
+/// chooses to ship one anyway. Precedence: an already-set `PYTHONHOME` wins,
+/// then `DW_PYTHON_HOME`, then a `python-runtime/` sibling directory.
 ///
-/// This sets both the `PYTHONHOME` env var *and* calls `Py_SetPythonHome`
-/// directly via the C API. The env var alone was not reliable for a
-/// statically-linked interpreter in practice (a static/LTO'd libpython can
-/// have already resolved its path config by the time `getenv("PYTHONHOME")`
-/// would normally be consulted, depending on exactly how/when the runtime's
-/// path-configuration step runs) -- `Py_SetPythonHome` is the API CPython's
-/// own embedding docs recommend for exactly this reason: it hands the
-/// interpreter the prefix directly rather than asking it to rediscover it
-/// from the environment.
+/// When something is found, this sets both the `PYTHONHOME` env var *and*
+/// calls `Py_SetPythonHome` directly via the C API, since the env var alone
+/// was not reliable for a statically-linked interpreter in practice.
 fn configure_python_home() {
     let home = std::env::var_os("PYTHONHOME")
         .map(PathBuf::from)
@@ -209,6 +275,7 @@ pub fn run_script(
     let source = std::fs::read_to_string(script_path)
         .with_context(|| format!("reading transform script {}", script_path.display()))?;
 
+    install_frozen_stdlib();
     configure_python_home();
 
     // Explicit rather than relying on pyo3's "auto-initialize" feature:

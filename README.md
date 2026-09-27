@@ -118,10 +118,11 @@ cargo build --release
 ```
 
 **CI build** (`.github/workflows/build.yml`, runs on every push): downloads
-a `python-build-standalone` distribution and statically links its
-`libpython*.a` in instead — no system Python needed to build, and no
-`libpython.so` dependency at run time either. See "Static linking via CI"
-below for how it works and what it produces.
+a `python-build-standalone` distribution, statically links its
+`libpython*.a` in, and freezes the standard library into the binary as
+bytecode — a true single-file `dw` with no system Python needed to build
+it and nothing else needed alongside it to run it. See "True single-binary
+embedding, via CI" below for how it works and what it produces.
 
 ### Output formats
 
@@ -131,11 +132,13 @@ call in the script writes immediately: multiple calls each print their own
 block to stdout, or overwrite the same `--output` file in turn (last call
 wins).
 
-## Static linking via CI
+## True single-binary embedding, via CI
 
-`.github/workflows/build.yml` runs on every push and does the interpreter
-swap the original design called for: no more system-Python dependency to
-build, and no `libpython.so` dependency to run. It:
+`.github/workflows/build.yml` runs on every push and produces a `dw` binary
+with Python fully embedded: no system Python needed to build it, no
+`libpython.so` dependency to run it, and — the part that makes it an
+actual single file — **no companion directory for the standard library
+either**. It:
 
 1. Resolves the latest (or a pinned) `astral-sh/python-build-standalone`
    release for CPython 3.11 / `x86_64-unknown-linux-gnu`, preferring an
@@ -149,50 +152,65 @@ build, and no `libpython.so` dependency to run. It:
    `_bz2`, `_ctypes`, `_ssl`, and others get compiled *into* `libpython.a`
    itself in a static build, but still reference symbols from those
    libraries) and passes them to `crates/cli/build.rs`, which emits the
-   matching `cargo:rustc-link-lib=static=...` directives. This is a no-op
-   locally (the env vars it reads are only set in CI), so it doesn't affect
-   a normal dev build against the system's dynamic libpython.
-4. Builds `dw`, then **verifies with `ldd`** that the resulting binary has
-   no dynamic dependency on libpython (confirmed: only `libc`, `libm`,
-   `libgcc_s`, and the dynamic linker remain).
-5. **Smoke-tests** the built binary against `examples/` with
-   `PYTHONHOME`/`PYTHONPATH` cleared from the environment, to prove it
-   doesn't accidentally depend on the runner's own Python.
-6. Packages the binary alongside a `python-runtime/` copy of the
-   distribution's install prefix (needed for the stdlib — see "Remaining
-   gap" below) and uploads it as a build artifact.
+   matching `cargo:rustc-link-lib=static=...` directives.
+4. Runs `scripts/freeze_stdlib.py`, using *that exact downloaded
+   interpreter*, to compile every pure-Python stdlib module to marshalled
+   bytecode and pack it into one blob + manifest.
+5. Builds `dw`. `crates/cli/build.rs` embeds that blob via `include_bytes!`
+   and generates a small entry table; `python_runtime.rs`'s
+   `install_frozen_stdlib` registers every module in it as a CPython
+   **frozen module** — the exact mechanism CPython itself already uses to
+   embed `importlib._bootstrap` — by prepending them to
+   `PyImport_FrozenModules` before the interpreter initializes.
+   `FrozenImporter` is always first on `sys.meta_path`, so `encodings`,
+   `io`, and everything else the interpreter needs at startup — and
+   anything a transformation script imports — resolves from memory before
+   the filesystem is ever consulted. All of steps 3–4 are no-ops locally
+   (the env vars they read are only set in CI), so a normal dev build
+   against the system's dynamic libpython/stdlib is unaffected.
+6. **Verifies with `ldd`** that the resulting binary has no dynamic
+   dependency on libpython (confirmed: only `libc`, `libm`, `libgcc_s`, and
+   the dynamic linker remain).
+7. **Smoke-tests in total isolation**: copies *only* the binary plus a
+   sample input/script into an empty temp directory elsewhere (no
+   `python-runtime/`, no repo checkout) and runs it there with a fully
+   scrubbed environment (`env -i`, no `PYTHONHOME`/`PYTHONPATH`) — proving
+   it's genuinely self-contained, not just "works when PYTHONHOME happens
+   to be set right."
+8. Packages **the binary alone** and uploads it as a build artifact.
 
-pyo3 itself required one nudge for this to work: it refuses to build with
-the `auto-initialize` feature against a statically-embeddable Python
+pyo3 itself needed one nudge along the way: it refuses to build with the
+`auto-initialize` feature against a statically-embeddable Python
 ("Embedding the Python interpreter statically does not yet have
 first-class support in PyO3... disable the auto-initialize feature").
-`crates/cli/src/python_runtime.rs` now calls
-`pyo3::prepare_freethreaded_python()` explicitly instead — the same thing
-`auto-initialize` did implicitly, and it works identically against a
-dynamically-linked system libpython, so local dev builds are unaffected.
+`crates/cli/src/python_runtime.rs` calls `pyo3::prepare_freethreaded_python()`
+explicitly instead — the same thing `auto-initialize` did implicitly, and
+it works identically against a dynamically-linked system libpython, so
+local dev builds are unaffected.
 
-None of this needed the `data`/`pandas`/`display` injection mechanism (or
-anything else in `crates/cli/src/python_runtime.rs` beyond that one
-initialization call) to change — the whole point of `pyo3-build-config`'s
-env-var-driven interpreter discovery is that swapping the linked
-interpreter is a build-environment change, not a code change.
+None of this needed the `data`/`pandas`/`display` injection mechanism to
+change at all — freezing the stdlib and swapping the linked interpreter are
+both build-environment changes, layered underneath that mechanism rather
+than through it.
 
-**Remaining gap:** even with libpython itself statically linked, the pure-
-Python standard library (`.py`/`.pyc` files) still needs to be found on
-disk at run time — this project doesn't yet wire up an
-`oxidized-importer`-style in-memory `sys.meta_path` finder for it, so the
-released bundle is a binary plus a `python-runtime/` directory
-(`configure_python_home` in `python_runtime.rs` points `PYTHONHOME` at it
-when it's present as a sibling of the executable), not a single file. True
-zero-disk stdlib loading is a distinct, larger follow-up: wiring in the
-`oxidized-importer` crate (the standalone, non-PyOxidizer-tool crate
-published under that name) as a meta path finder over the distribution's
-packed resources data.
+**Known remaining gap:** the freeze script compiles every pure-Python
+stdlib module it finds under the distribution's `lib/pythonX.Y/` (skipping
+`test`/`tests`/`lib2to3`/`site-packages`), and essentially all commonly-used
+C-extension modules come pre-compiled as interpreter builtins in a
+`python-build-standalone` static build (confirmed by the extra-static-libs
+step above — `_bz2`, `_ctypes`, etc. are already linked in, not loaded from
+`.so` files). An obscure extension module that a *different*
+python-build-standalone build variant ships as a separate `lib-dynload/*.so`
+rather than a builtin would still need that file on disk; none of this
+project's own code (the `pandas` drop-in, the CLI itself) hits that case,
+but a transformation script importing something unusual might. Widening the
+freeze coverage or handling that fallback is future work if it comes up.
 
 ## What's deliberately out of scope for v1
 
 - Zip-of-modules transformation input (single `.py` file only).
 - A complete pandas API surface — methods are added as real scripts need
   them (see the drop-in's module docstring).
-- Fully single-file distribution (binary with no companion directory) —
-  see "Remaining gap" above.
+- A fallback path for stdlib C extensions that aren't compiled in as
+  builtins on some other target triple/build variant — see "Known
+  remaining gap" above.

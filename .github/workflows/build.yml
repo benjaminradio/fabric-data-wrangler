@@ -146,12 +146,30 @@ jobs:
           INSTALL_PREFIX=$(dirname "$(dirname "$PYEXE")")
           echo "install_prefix=$INSTALL_PREFIX" >> "$GITHUB_OUTPUT"
           echo "pyver=$PYVER" >> "$GITHUB_OUTPUT"
+          echo "pyexe=$PYEXE" >> "$GITHUB_OUTPUT"
+          echo "stdlib_dir=$INSTALL_PREFIX/lib/python$PYVER" >> "$GITHUB_OUTPUT"
 
-      - name: Build (statically linked libpython)
+      - name: Freeze the stdlib into bytecode
+        id: freeze
+        run: |
+          set -euo pipefail
+          FROZEN_DIR="$GITHUB_WORKSPACE/frozen-stdlib"
+          # Must run with the exact interpreter whose libpython we're
+          # linking: marshalled bytecode isn't portable across versions,
+          # and frozen modules are unmarshalled with no magic-number check
+          # to catch a mismatch (see scripts/freeze_stdlib.py's docstring).
+          "${{ steps.pyo3cfg.outputs.pyexe }}" scripts/freeze_stdlib.py \
+            "${{ steps.pyo3cfg.outputs.stdlib_dir }}" "$FROZEN_DIR"
+          echo "---- frozen-stdlib dir ----"
+          ls -la "$FROZEN_DIR"
+          echo "frozen_dir=$FROZEN_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Build (statically linked libpython, frozen stdlib)
         env:
           PYO3_CONFIG_FILE: ${{ steps.pyo3cfg.outputs.config_path }}
           DW_EXTRA_STATIC_LIBS: ${{ steps.pyo3cfg.outputs.extra_static_libs }}
           DW_EXTRA_STATIC_LIB_DIRS: ${{ steps.pyo3cfg.outputs.extra_static_lib_dirs }}
+          DW_FROZEN_STDLIB_DIR: ${{ steps.freeze.outputs.frozen_dir }}
         run: cargo build --release --workspace
 
       - name: Verify libpython is not a dynamic dependency
@@ -165,23 +183,29 @@ jobs:
           fi
           echo "OK: no dynamic libpython dependency"
 
-      - name: Package the runtime bundle (binary + stdlib sibling dir)
+      - name: Smoke test in total isolation (no companion files, no env vars)
+        run: |
+          set -euo pipefail
+          # The whole point of freezing the stdlib in: dw must run as a
+          # single file, with nothing else present -- no python-runtime/
+          # directory, no PYTHONHOME/PYTHONPATH, not even run from the repo
+          # checkout. Copy *only* the binary plus the input/script into an
+          # empty directory elsewhere and run it from there with a
+          # scrubbed environment.
+          ISOLATED=$(mktemp -d)
+          cp target/release/dw "$ISOLATED/dw"
+          cp examples/sample.csv examples/transform_example.py "$ISOLATED/"
+          ls -la "$ISOLATED"
+          cd "$ISOLATED"
+          env -i PATH=/usr/bin:/bin \
+            ./dw --input sample.csv --script transform_example.py
+
+      - name: Package artifact (binary only)
         run: |
           set -euo pipefail
           mkdir -p dist
           cp target/release/dw dist/dw
-          cp -r "${{ steps.pyo3cfg.outputs.install_prefix }}" dist/python-runtime
-
-      - name: Smoke test (system PYTHONHOME/PYTHONPATH cleared)
-        run: |
-          set -euo pipefail
-          env -u PYTHONHOME -u PYTHONPATH \
-            ./dist/dw --input examples/sample.csv --script examples/transform_example.py
-
-      - name: Package artifact
-        run: |
-          set -euo pipefail
-          tar -C dist -czf dw-${{ env.TARGET_TRIPLE }}.tar.gz .
+          tar -C dist -czf dw-${{ env.TARGET_TRIPLE }}.tar.gz dw
 
       - uses: actions/upload-artifact@v4
         with:
