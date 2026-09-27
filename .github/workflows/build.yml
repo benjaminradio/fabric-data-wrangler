@@ -125,6 +125,22 @@ jobs:
 
           echo "config_path=$CONFIG_PATH" >> "$GITHUB_OUTPUT"
 
+          # Statically-compiled stdlib extensions (_bz2, _ctypes, _ssl, ...)
+          # depend on their own bundled native static libs, which
+          # pyo3-build-config's config file has no field for. Discover
+          # whatever the distribution shipped and pass them to crates/cli's
+          # build.rs via env vars instead.
+          mapfile -t EXTRA_LIBS < <(find pbs -name 'lib*.a' ! -name 'libpython*' -exec basename {} \; | sed -e 's/^lib//' -e 's/\.a$//' | sort -u)
+          mapfile -t EXTRA_DIRS < <(find pbs -name 'lib*.a' ! -name 'libpython*' -exec dirname {} \; | sort -u)
+          echo "Extra static libs found: ${EXTRA_LIBS[*]:-<none>}"
+          echo "Extra static lib dirs: ${EXTRA_DIRS[*]:-<none>}"
+          {
+            echo "extra_static_libs=$(IFS=,; echo "${EXTRA_LIBS[*]}")"
+            echo "extra_static_lib_dirs<<EOF_DIRS"
+            for d in "${EXTRA_DIRS[@]:-}"; do [ -n "$d" ] && realpath "$d"; done
+            echo "EOF_DIRS"
+          } >> "$GITHUB_OUTPUT"
+
           # PYTHONHOME must point at the install *prefix* (containing
           # bin/, lib/pythonX.Y/, etc.), not directly at lib/.
           INSTALL_PREFIX=$(dirname "$(dirname "$PYEXE")")
@@ -134,6 +150,8 @@ jobs:
       - name: Build (statically linked libpython)
         env:
           PYO3_CONFIG_FILE: ${{ steps.pyo3cfg.outputs.config_path }}
+          DW_EXTRA_STATIC_LIBS: ${{ steps.pyo3cfg.outputs.extra_static_libs }}
+          DW_EXTRA_STATIC_LIB_DIRS: ${{ steps.pyo3cfg.outputs.extra_static_lib_dirs }}
         run: cargo build --release --workspace
 
       - name: Verify libpython is not a dynamic dependency
