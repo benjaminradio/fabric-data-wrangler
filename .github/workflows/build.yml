@@ -12,11 +12,25 @@ env:
   # reproducibility.
   PBS_RELEASE_TAG: latest
   PBS_PYTHON_SERIES: "3.11"
-  TARGET_TRIPLE: x86_64-unknown-linux-gnu
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # Windows runners ship Git Bash; using it for every step lets the
+        # Linux and Windows jobs share one script, branching on $RUNNER_OS
+        # only where the two platforms genuinely differ (library/executable
+        # naming, stdlib directory layout).
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -44,12 +58,12 @@ jobs:
 
           # Prefer an optimized "full" build (contains static libs + headers,
           # not just the redistributable "install_only" runtime), for our
-          # exact Python series and target triple. Fall back from
-          # pgo+lto -> pgo -> lto -> plain if a given variant isn't published
-          # for this triple.
+          # exact Python series and target triple. Fall back through a few
+          # variant names if a given one isn't published for this triple --
+          # Windows' variant matrix doesn't necessarily match Linux's.
           asset_url=""
-          for variant in "pgo+lto-full" "pgo-full" "lto-full" "full"; do
-            asset_url=$(echo "$release_json" | jq -r --arg series "cpython-$PBS_PYTHON_SERIES." --arg triple "$TARGET_TRIPLE" --arg variant "$variant" \
+          for variant in "pgo+lto-full" "pgo-full" "lto-full" "static-noopt-full" "full"; do
+            asset_url=$(echo "$release_json" | jq -r --arg series "cpython-$PBS_PYTHON_SERIES." --arg triple "${{ matrix.triple }}" --arg variant "$variant" \
               '.assets[] | select(.name | startswith($series)) | select(.name | contains($triple)) | select(.name | endswith($variant + ".tar.zst")) | .browser_download_url' \
               | head -n1)
             if [ -n "$asset_url" ]; then
@@ -59,7 +73,7 @@ jobs:
           done
 
           if [ -z "$asset_url" ]; then
-            echo "::error::No matching python-build-standalone asset found for series=$PBS_PYTHON_SERIES triple=$TARGET_TRIPLE"
+            echo "::error::No matching python-build-standalone asset found for series=$PBS_PYTHON_SERIES triple=${{ matrix.triple }}"
             echo "$release_json" | jq -r '.assets[].name'
             exit 1
           fi
@@ -79,19 +93,29 @@ jobs:
         id: pyo3cfg
         run: |
           set -euo pipefail
-          STATIC_LIB=$(find pbs -name 'libpython3.*.a' | head -n1)
-          PYEXE=$(find pbs -type f -path '*/install/bin/python3.*' | grep -v config | head -n1)
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # python-build-standalone's Windows layout puts python.exe at
+            # the install prefix root (no bin/ subdir) and static .lib files
+            # typically under an install/libs/ directory, named pythonXY.lib
+            # (no "lib" prefix -- that's a Unix/MSYS convention, not MSVC's).
+            STATIC_LIB=$(find pbs -iname 'python3*.lib' ! -iname '*_d.lib' | head -n1)
+            PYEXE=$(find pbs -iname 'python.exe' | head -n1)
+          else
+            STATIC_LIB=$(find pbs -name 'libpython3.*.a' | head -n1)
+            PYEXE=$(find pbs -type f -path '*/install/bin/python3.*' | grep -v config | head -n1)
+          fi
 
           if [ -z "$STATIC_LIB" ]; then
-            echo "::error::No static libpython*.a found in the downloaded distribution"
-            find pbs -name 'libpython*'
+            echo "::error::No static python lib found in the downloaded distribution"
+            find pbs -iname '*python3*'
             exit 1
           fi
           if [ -z "$PYEXE" ]; then
-            echo "::error::No python3 executable found under */install/bin in the downloaded distribution"
+            echo "::error::No python executable found in the downloaded distribution"
             exit 1
           fi
-          chmod +x "$PYEXE"
+          chmod +x "$PYEXE" || true
 
           # Must be absolute: pyo3-build-config emits these paths verbatim
           # into cargo:rustc-link-search / the executable path it shells
@@ -99,11 +123,19 @@ jobs:
           # against the crate's build directory.
           STATIC_LIB=$(realpath "$STATIC_LIB")
           PYEXE=$(realpath "$PYEXE")
+          echo "Static lib: $STATIC_LIB ($(du -h "$STATIC_LIB" | cut -f1))"
+          echo "Python executable: $PYEXE"
 
           LIB_DIR=$(dirname "$STATIC_LIB")
           LIB_FILE=$(basename "$STATIC_LIB")
-          LIB_NAME=${LIB_FILE#lib}
-          LIB_NAME=${LIB_NAME%.a}
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # MSVC has no "lib" stripping convention: the full stem (minus
+            # the extension rustc adds back) is what the linker expects.
+            LIB_NAME=${LIB_FILE%.lib}
+          else
+            LIB_NAME=${LIB_FILE#lib}
+            LIB_NAME=${LIB_NAME%.a}
+          fi
           PYVER=$("$PYEXE" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
 
           CONFIG_PATH="$GITHUB_WORKSPACE/pyo3-build-config.txt"
@@ -130,8 +162,13 @@ jobs:
           # pyo3-build-config's config file has no field for. Discover
           # whatever the distribution shipped and pass them to crates/cli's
           # build.rs via env vars instead.
-          mapfile -t EXTRA_LIBS < <(find pbs -name 'lib*.a' ! -name 'libpython*' -exec basename {} \; | sed -e 's/^lib//' -e 's/\.a$//' | sort -u)
-          mapfile -t EXTRA_DIRS < <(find pbs -name 'lib*.a' ! -name 'libpython*' -exec dirname {} \; | sort -u)
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            mapfile -t EXTRA_LIBS < <(find pbs -iname '*.lib' ! -iname '*_d.lib' | grep -vi -- "${LIB_FILE}\$" | xargs -n1 basename | sed 's/\.[Ll][Ii][Bb]$//' | sort -u)
+            mapfile -t EXTRA_DIRS < <(find pbs -iname '*.lib' ! -iname '*_d.lib' | grep -vi -- "${LIB_FILE}\$" | xargs -n1 dirname | sort -u)
+          else
+            mapfile -t EXTRA_LIBS < <(find pbs -name 'lib*.a' ! -name 'libpython*' -exec basename {} \; | sed -e 's/^lib//' -e 's/\.a$//' | sort -u)
+            mapfile -t EXTRA_DIRS < <(find pbs -name 'lib*.a' ! -name 'libpython*' -exec dirname {} \; | sort -u)
+          fi
           echo "Extra static libs found: ${EXTRA_LIBS[*]:-<none>}"
           echo "Extra static lib dirs: ${EXTRA_DIRS[*]:-<none>}"
           {
@@ -141,13 +178,21 @@ jobs:
             echo "EOF_DIRS"
           } >> "$GITHUB_OUTPUT"
 
-          # PYTHONHOME must point at the install *prefix* (containing
-          # bin/, lib/pythonX.Y/, etc.), not directly at lib/.
-          INSTALL_PREFIX=$(dirname "$(dirname "$PYEXE")")
+          # PYTHONHOME must point at the install *prefix*. On POSIX that's
+          # two levels up from bin/python3.x, with the stdlib under
+          # lib/pythonX.Y/; on Windows python.exe already sits at the
+          # prefix root, with the stdlib directly under Lib/.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            INSTALL_PREFIX=$(dirname "$PYEXE")
+            STDLIB_DIR="$INSTALL_PREFIX/Lib"
+          else
+            INSTALL_PREFIX=$(dirname "$(dirname "$PYEXE")")
+            STDLIB_DIR="$INSTALL_PREFIX/lib/python$PYVER"
+          fi
           echo "install_prefix=$INSTALL_PREFIX" >> "$GITHUB_OUTPUT"
           echo "pyver=$PYVER" >> "$GITHUB_OUTPUT"
           echo "pyexe=$PYEXE" >> "$GITHUB_OUTPUT"
-          echo "stdlib_dir=$INSTALL_PREFIX/lib/python$PYVER" >> "$GITHUB_OUTPUT"
+          echo "stdlib_dir=$STDLIB_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Freeze the stdlib into bytecode
         id: freeze
@@ -172,7 +217,8 @@ jobs:
           DW_FROZEN_STDLIB_DIR: ${{ steps.freeze.outputs.frozen_dir }}
         run: cargo build --release --workspace
 
-      - name: Verify libpython is not a dynamic dependency
+      - name: Verify libpython is not a dynamic dependency (Linux)
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           echo "---- ldd target/release/dw ----"
@@ -183,31 +229,53 @@ jobs:
           fi
           echo "OK: no dynamic libpython dependency"
 
+      - name: Check for a python DLL dependency (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          DUMPBIN=$(find "/c/Program Files/Microsoft Visual Studio" -iname dumpbin.exe 2>/dev/null | grep -i hostx64/x64 | head -n1 || true)
+          if [ -n "$DUMPBIN" ]; then
+            echo "---- dumpbin /dependents ----"
+            "$DUMPBIN" /dependents target/release/dw.exe || true
+          else
+            echo "dumpbin not found; skipping (the isolation smoke test below is the authoritative check)"
+          fi
+
       - name: Smoke test in total isolation (no companion files, no env vars)
         run: |
           set -euo pipefail
+          EXE_NAME=dw
+          [ "$RUNNER_OS" = "Windows" ] && EXE_NAME=dw.exe
           # The whole point of freezing the stdlib in: dw must run as a
           # single file, with nothing else present -- no python-runtime/
-          # directory, no PYTHONHOME/PYTHONPATH, not even run from the repo
-          # checkout. Copy *only* the binary plus the input/script into an
-          # empty directory elsewhere and run it from there with a
-          # scrubbed environment.
+          # directory, no Lib/ folder, no PYTHONHOME/PYTHONPATH, not even
+          # run from the repo checkout. Copy *only* the binary plus the
+          # input/script into an empty directory elsewhere and run it from
+          # there with a scrubbed environment.
           ISOLATED=$(mktemp -d)
-          cp target/release/dw "$ISOLATED/dw"
+          cp "target/release/$EXE_NAME" "$ISOLATED/$EXE_NAME"
           cp examples/sample.csv examples/transform_example.py "$ISOLATED/"
           ls -la "$ISOLATED"
           cd "$ISOLATED"
           env -i PATH=/usr/bin:/bin \
-            ./dw --input sample.csv --script transform_example.py
+            "./$EXE_NAME" --input sample.csv --script transform_example.py
 
       - name: Package artifact (binary only)
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp target/release/dw dist/dw
-          tar -C dist -czf dw-${{ env.TARGET_TRIPLE }}.tar.gz dw
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/dw.exe dist/dw.exe
+            (cd dist && 7z a "$GITHUB_WORKSPACE/dw-${{ matrix.triple }}.zip" dw.exe)
+          else
+            cp target/release/dw dist/dw
+            tar -C dist -czf dw-${{ matrix.triple }}.tar.gz dw
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dw-${{ env.TARGET_TRIPLE }}
-          path: dw-${{ env.TARGET_TRIPLE }}.tar.gz
+          name: dw-${{ matrix.triple }}
+          path: |
+            dw-${{ matrix.triple }}.tar.gz
+            dw-${{ matrix.triple }}.zip
+          if-no-files-found: ignore

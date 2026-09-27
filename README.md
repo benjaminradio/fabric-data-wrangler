@@ -168,22 +168,29 @@ wins).
 
 ## True single-binary embedding, via CI
 
-`.github/workflows/build.yml` runs on every push and produces a `dw` binary
-with Python fully embedded: no system Python needed to build it, no
-`libpython.so` dependency to run it, and — the part that makes it an
-actual single file — **no companion directory for the standard library
-either**. It:
+`.github/workflows/build.yml` runs on every push, as a matrix over
+`ubuntu-latest` (`x86_64-unknown-linux-gnu`) and `windows-latest`
+(`x86_64-pc-windows-msvc`), and produces a `dw`/`dw.exe` binary with
+Python fully embedded: no system Python needed to build it, no
+`libpython.so`/`pythonXY.dll` dependency to run it, and — the part that
+makes it an actual single file — **no companion directory for the
+standard library either**. Both platforms share one script (Windows
+runners ship Git Bash, so the whole job runs under `shell: bash`), which
+branches only where the two genuinely differ (library/executable naming,
+stdlib directory layout — POSIX's `lib/pythonX.Y/` vs. Windows' `Lib/`
+directly under the install prefix). For each platform, it:
 
 1. Resolves the latest (or a pinned) `astral-sh/python-build-standalone`
-   release for CPython 3.11 / `x86_64-unknown-linux-gnu`, preferring an
-   optimized "full" build and falling back through `pgo+lto` → `pgo` →
-   `lto` → plain if a variant isn't published for this triple.
+   release for CPython 3.11 / the target triple, preferring an optimized
+   "full" build and falling back through a few variant names if a given
+   one isn't published for that triple.
 2. Generates a `pyo3-build-config` file pointing `PYO3_CONFIG_FILE` at that
-   distribution's static `libpython*.a` (`shared=false`), instead of
-   letting pyo3 auto-discover the system's `python3-config`.
+   distribution's static Python lib (`libpython*.a` on Linux,
+   `python3*.lib` on Windows; `shared=false`), instead of letting pyo3
+   auto-discover a system interpreter.
 3. Discovers whichever other static libs the distribution bundles for its
-   statically-compiled stdlib C extensions (`libbz2.a`, `libffi.a`, etc. —
-   `_bz2`, `_ctypes`, `_ssl`, and others get compiled *into* `libpython.a`
+   statically-compiled stdlib C extensions (`libbz2`, `libffi`, etc. —
+   `_bz2`, `_ctypes`, `_ssl`, and others get compiled *into* the Python lib
    itself in a static build, but still reference symbols from those
    libraries) and passes them to `crates/cli/build.rs`, which emits the
    matching `cargo:rustc-link-lib=static=...` directives.
@@ -201,17 +208,31 @@ either**. It:
    anything a transformation script imports — resolves from memory before
    the filesystem is ever consulted. All of steps 3–4 are no-ops locally
    (the env vars they read are only set in CI), so a normal dev build
-   against the system's dynamic libpython/stdlib is unaffected.
-6. **Verifies with `ldd`** that the resulting binary has no dynamic
-   dependency on libpython (confirmed: only `libc`, `libm`, `libgcc_s`, and
-   the dynamic linker remain).
+   against a system interpreter is unaffected. None of this Rust code is
+   platform-specific; `pyo3-build-config`/`pyo3::ffi` are what make the
+   same source work against either target.
+6. **Verifies there's no dynamic dependency on the Python library**: `ldd`
+   on Linux (confirmed: only `libc`, `libm`, `libgcc_s`, and the dynamic
+   linker remain), `dumpbin /dependents` on Windows where available
+   (informational — the isolation test below is the authoritative check).
 7. **Smoke-tests in total isolation**: copies *only* the binary plus a
    sample input/script into an empty temp directory elsewhere (no
-   `python-runtime/`, no repo checkout) and runs it there with a fully
-   scrubbed environment (`env -i`, no `PYTHONHOME`/`PYTHONPATH`) — proving
-   it's genuinely self-contained, not just "works when PYTHONHOME happens
-   to be set right."
-8. Packages **the binary alone** and uploads it as a build artifact.
+   `python-runtime/`/`Lib/`, no repo checkout) and runs it there with a
+   fully scrubbed environment (`env -i`, no `PYTHONHOME`/`PYTHONPATH`) —
+   proving it's genuinely self-contained, not just "works when some
+   environment variable happens to be set right."
+8. Packages **the binary alone** (`.tar.gz` on Linux, `.zip` on Windows)
+   and uploads it as a build artifact.
+
+**Windows is new and less battle-tested than Linux here**: this project's
+sandbox has no Windows/MSVC toolchain to develop or verify against
+locally, so unlike the Linux path (which went through several real
+CI-driven fixes before it worked — see the git history), the Windows job
+is a best-effort first pass, validated only by whatever the CI runs
+themselves show. If it needs another round of fixes (MSVC has its own
+static-vs-import-library and CRT-linkage subtleties that differ from
+Linux's `.a` static archives), check the latest Actions run for that
+branch.
 
 pyo3 itself needed one nudge along the way: it refuses to build with the
 `auto-initialize` feature against a statically-embeddable Python
