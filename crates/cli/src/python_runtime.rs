@@ -169,6 +169,16 @@ pub fn run_script(
 
     configure_python_home();
 
+    // Explicit rather than relying on pyo3's "auto-initialize" feature:
+    // when linked against a statically-embeddable python-build-standalone
+    // interpreter (see .github/workflows/build.yml), pyo3 refuses to build
+    // with "auto-initialize" enabled and requires this manual call instead
+    // (static embedding has caveats around interpreter finalization/restart
+    // that auto-initialize's implicit behavior doesn't account for). This
+    // same call works identically against a dynamically-linked system
+    // libpython, so it's used unconditionally rather than gated per build.
+    pyo3::prepare_freethreaded_python();
+
     Python::with_gil(|py| -> Result<()> {
         install_pandas_dropin(py).map_err(|e| anyhow!("installing pandas drop-in: {e}"))?;
 
