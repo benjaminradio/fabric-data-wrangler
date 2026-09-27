@@ -56,15 +56,20 @@ jobs:
             release_json=$(gh api "repos/astral-sh/python-build-standalone/releases/tags/$PBS_RELEASE_TAG")
           fi
 
-          # Prefer an optimized "full" build (contains static libs + headers,
-          # not just the redistributable "install_only" runtime), for our
-          # exact Python series and target triple. Fall back through a few
-          # variant names if a given one isn't published for this triple --
-          # Windows' variant matrix doesn't necessarily match Linux's.
+          # "install_only" is the plain, standard, well-supported flavor --
+          # a redistributable Python runtime dynamically linked against its
+          # own libpython/DLL (what pyenv/uv/etc. use under the hood) -- as
+          # opposed to the "full" build-artifact flavor, which turned out to
+          # give a genuinely static libpython on Linux but only a partial,
+          # unusable one on Windows (see git history). Since dw now ships
+          # its Python shared library alongside the binary on both
+          # platforms anyway (see "Package artifact" below), there's no
+          # reason to chase the more complex "full" flavor's static linking
+          # only to still need extra static libs for stdlib extensions.
           asset_url=""
-          for variant in "pgo+lto-full" "pgo-full" "lto-full" "static-noopt-full" "full"; do
+          for variant in "install_only" "install_only_stripped"; do
             asset_url=$(echo "$release_json" | jq -r --arg series "cpython-$PBS_PYTHON_SERIES." --arg triple "${{ matrix.triple }}" --arg variant "$variant" \
-              '.assets[] | select(.name | startswith($series)) | select(.name | contains($triple)) | select(.name | endswith($variant + ".tar.zst")) | .browser_download_url' \
+              '.assets[] | select(.name | startswith($series)) | select(.name | contains($triple)) | select((.name | endswith($variant + ".tar.gz")) or (.name | endswith($variant + ".tar.zst"))) | .browser_download_url' \
               | head -n1)
             if [ -n "$asset_url" ]; then
               echo "Selected variant: $variant"
@@ -85,38 +90,42 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p pbs
-          curl -sSL "${{ steps.pbs.outputs.asset_url }}" -o pbs.tar.zst
-          tar --zstd -xf pbs.tar.zst -C pbs
+          URL="${{ steps.pbs.outputs.asset_url }}"
+          case "$URL" in
+            *.tar.zst) EXT=tar.zst ;;
+            *.tar.gz) EXT=tar.gz ;;
+            *) echo "::error::unrecognized archive extension: $URL"; exit 1 ;;
+          esac
+          curl -sSL "$URL" -o "pbs.$EXT"
+          if [ "$EXT" = "tar.zst" ]; then
+            tar --zstd -xf "pbs.$EXT" -C pbs
+          else
+            tar -xzf "pbs.$EXT" -C pbs
+          fi
           find pbs -maxdepth 2
 
-      - name: Generate pyo3 static-link config
+      - name: Generate pyo3 dynamic-link config
         id: pyo3cfg
         run: |
           set -euo pipefail
 
-          # On Windows, this is NOT actually a static library the way it is
-          # on Linux: CI evidence showed python-build-standalone's Windows
-          # "static" build (build/core/python311.lib) doesn't itself define
-          # the CPython C API (linking against it failed with ~40 unresolved
-          # symbols: _Py_NoneStruct, PyExc_TypeError, PyModule_Type, ...) --
-          # only the DLL does. python-build-standalone's Windows story is
-          # dynamic linking (pythonXY.dll + its import library), not the
-          # fully-static embedding Linux supports. So on Windows this is the
-          # *import* library under install/libs/, and DW_DLL below is the
-          # actual runtime DLL dw.exe will depend on (still no Lib/
-          # directory needed, since the stdlib is frozen in either way).
+          # dw dynamically links Python on both platforms (see the
+          # "install_only" note above) and ships the shared
+          # library/DLL alongside the binary, the same way any program
+          # ships its runtime dependencies -- DW_PYLIB below is that file.
           if [ "$RUNNER_OS" = "Windows" ]; then
-            STATIC_LIB=$(find pbs -ipath '*/install/libs/python3[0-9][0-9].lib' | head -n1)
-            DW_DLL=$(find pbs -iname 'python3[0-9][0-9].dll' | grep -vi '/venv/' | head -n1)
+            IMPORT_LIB=$(find pbs -ipath '*/install/libs/python3[0-9][0-9].lib' | head -n1)
+            DW_PYLIB=$(find pbs -iname 'python3[0-9][0-9].dll' | grep -vi '/venv/' | head -n1)
             # Exclude the venv module's own bundled launcher stub
             # (Lib/venv/scripts/nt/python.exe) -- not the real interpreter.
             PYEXE=$(find pbs -iname 'python.exe' | grep -vi '/venv/' | sort | head -n1)
           else
-            STATIC_LIB=$(find pbs -name 'libpython3.*.a' | head -n1)
+            IMPORT_LIB=$(find pbs -name 'libpython3.*.so*' | sort | head -n1)
+            DW_PYLIB="$IMPORT_LIB"
             PYEXE=$(find pbs -type f -path '*/install/bin/python3.*' | grep -v config | head -n1)
           fi
 
-          if [ -z "$STATIC_LIB" ]; then
+          if [ -z "$IMPORT_LIB" ]; then
             echo "::error::No python link library found in the downloaded distribution"
             find pbs -iname '*python3*'
             exit 1
@@ -125,8 +134,8 @@ jobs:
             echo "::error::No python executable found in the downloaded distribution"
             exit 1
           fi
-          if [ "$RUNNER_OS" = "Windows" ] && [ -z "$DW_DLL" ]; then
-            echo "::error::No pythonXY.dll found in the downloaded distribution"
+          if [ -z "$DW_PYLIB" ]; then
+            echo "::error::No python shared library/DLL found in the downloaded distribution"
             exit 1
           fi
           chmod +x "$PYEXE" || true
@@ -135,34 +144,32 @@ jobs:
           # into cargo:rustc-link-search / the executable path it shells
           # out to, and a relative path here does not reliably resolve
           # against the crate's build directory.
-          STATIC_LIB=$(realpath "$STATIC_LIB")
+          IMPORT_LIB=$(realpath "$IMPORT_LIB")
           PYEXE=$(realpath "$PYEXE")
-          [ "$RUNNER_OS" = "Windows" ] && DW_DLL=$(realpath "$DW_DLL")
-          echo "Link library: $STATIC_LIB ($(du -h "$STATIC_LIB" | cut -f1))"
+          DW_PYLIB=$(realpath "$DW_PYLIB")
+          echo "Link library: $IMPORT_LIB"
           echo "Python executable: $PYEXE"
-          [ "$RUNNER_OS" = "Windows" ] && echo "Runtime DLL: $DW_DLL"
+          echo "Runtime shared library: $DW_PYLIB"
 
-          LIB_DIR=$(dirname "$STATIC_LIB")
-          LIB_FILE=$(basename "$STATIC_LIB")
+          LIB_DIR=$(dirname "$IMPORT_LIB")
+          LIB_FILE=$(basename "$IMPORT_LIB")
           if [ "$RUNNER_OS" = "Windows" ]; then
             # MSVC has no "lib" stripping convention: the full stem (minus
             # the extension rustc adds back) is what the linker expects.
             LIB_NAME=${LIB_FILE%.lib}
           else
             LIB_NAME=${LIB_FILE#lib}
-            LIB_NAME=${LIB_NAME%.a}
+            LIB_NAME=${LIB_NAME%%.so*}
           fi
           PYVER=$("$PYEXE" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
 
           # pyo3-build-config's file is parsed by a native Rust build
           # script, which (on Windows) needs real Windows paths -- Git
           # Bash's own `realpath` above produces its MSYS/POSIX form
-          # (e.g. /d/a/repo/repo), which Windows APIs cannot resolve (that
-          # is genuinely what broke here: "could not find native static
-          # library python311" the first time this ran, because lib_dir
-          # was an MSYS path). $GITHUB_WORKSPACE itself is already a
-          # native path, so config_path below doesn't need this, but
-          # lib_dir/executable (derived from `realpath`) do.
+          # (e.g. /d/a/repo/repo), which Windows APIs cannot resolve.
+          # $GITHUB_WORKSPACE itself is already a native path, so
+          # config_path below doesn't need this, but lib_dir/executable
+          # (derived from `realpath`) do.
           if [ "$RUNNER_OS" = "Windows" ]; then
             CFG_LIB_DIR=$(cygpath -w "$LIB_DIR")
             CFG_EXECUTABLE=$(cygpath -w "$PYEXE")
@@ -171,21 +178,11 @@ jobs:
             CFG_EXECUTABLE="$PYEXE"
           fi
 
-          # shared=false on Linux (genuine static embedding). On Windows,
-          # shared=true: LIB_NAME/CFG_LIB_DIR point at the *import* library,
-          # which only works together with the DLL actually being present
-          # at run time (see DW_DLL above).
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            SHARED=true
-          else
-            SHARED=false
-          fi
-
           CONFIG_PATH="$GITHUB_WORKSPACE/pyo3-build-config.txt"
           cat > "$CONFIG_PATH" <<EOF
           implementation=CPython
           version=$PYVER
-          shared=$SHARED
+          shared=true
           abi3=false
           lib_name=$LIB_NAME
           lib_dir=$CFG_LIB_DIR
@@ -200,57 +197,27 @@ jobs:
 
           echo "config_path=$CONFIG_PATH" >> "$GITHUB_OUTPUT"
 
-          # Statically-compiled stdlib extensions (_bz2, _ctypes, _ssl, ...)
-          # depend on their own bundled native static libs, which
-          # pyo3-build-config's config file has no field for. Only relevant
-          # for genuine static linking (Linux); on Windows we dynamically
-          # link the DLL, which already contains all of this.
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            EXTRA_LIBS=()
-            EXTRA_DIRS=()
-          else
-            mapfile -t EXTRA_LIBS < <(find pbs -name 'lib*.a' ! -name 'libpython*' -exec basename {} \; | sed -e 's/^lib//' -e 's/\.a$//' | sort -u)
-            mapfile -t EXTRA_DIRS < <(find pbs -name 'lib*.a' ! -name 'libpython*' -exec dirname {} \; | sort -u)
-          fi
-          echo "Extra static libs found: ${EXTRA_LIBS[*]:-<none>}"
-          echo "Extra static lib dirs: ${EXTRA_DIRS[*]:-<none>}"
-          {
-            echo "extra_static_libs=$(IFS=,; echo "${EXTRA_LIBS[*]}")"
-            echo "extra_static_lib_dirs<<EOF_DIRS"
-            for d in "${EXTRA_DIRS[@]:-}"; do
-              [ -z "$d" ] && continue
-              d=$(realpath "$d")
-              # Also consumed by a native Rust build script (crates/cli/build.rs
-              # -> cargo:rustc-link-search) -- same MSYS-path problem as above.
-              [ "$RUNNER_OS" = "Windows" ] && d=$(cygpath -w "$d")
-              echo "$d"
-            done
-            echo "EOF_DIRS"
-          } >> "$GITHUB_OUTPUT"
-
           # PYTHONHOME must point at the install *prefix*. On POSIX that's
           # two levels up from bin/python3.x, with the stdlib under
           # lib/pythonX.Y/; on Windows python.exe already sits at the
-          # prefix root, with the stdlib directly under Lib/.
+          # prefix root, with the stdlib directly under Lib/. Only used by
+          # the freeze step below now (see python_runtime.rs -- with the
+          # stdlib frozen in, dw itself no longer needs PYTHONHOME at all).
           if [ "$RUNNER_OS" = "Windows" ]; then
-            INSTALL_PREFIX=$(dirname "$PYEXE")
-            STDLIB_DIR="$INSTALL_PREFIX/Lib"
+            STDLIB_DIR="$(dirname "$PYEXE")/Lib"
           else
-            INSTALL_PREFIX=$(dirname "$(dirname "$PYEXE")")
-            STDLIB_DIR="$INSTALL_PREFIX/lib/python$PYVER"
+            STDLIB_DIR="$(dirname "$(dirname "$PYEXE")")/lib/python$PYVER"
           fi
-          echo "install_prefix=$INSTALL_PREFIX" >> "$GITHUB_OUTPUT"
-          echo "pyver=$PYVER" >> "$GITHUB_OUTPUT"
           echo "pyexe=$PYEXE" >> "$GITHUB_OUTPUT"
           echo "stdlib_dir=$STDLIB_DIR" >> "$GITHUB_OUTPUT"
-          echo "dll=${DW_DLL:-}" >> "$GITHUB_OUTPUT"
+          echo "pylib=$DW_PYLIB" >> "$GITHUB_OUTPUT"
 
       - name: Freeze the stdlib into bytecode
         id: freeze
         run: |
           set -euo pipefail
           FROZEN_DIR="$GITHUB_WORKSPACE/frozen-stdlib"
-          # Must run with the exact interpreter whose libpython we're
+          # Must run with the exact interpreter whose Python library we're
           # linking: marshalled bytecode isn't portable across versions,
           # and frozen modules are unmarshalled with no magic-number check
           # to catch a mismatch (see scripts/freeze_stdlib.py's docstring).
@@ -263,69 +230,58 @@ jobs:
       - name: Build (embedded interpreter, frozen stdlib)
         env:
           PYO3_CONFIG_FILE: ${{ steps.pyo3cfg.outputs.config_path }}
-          DW_EXTRA_STATIC_LIBS: ${{ steps.pyo3cfg.outputs.extra_static_libs }}
-          DW_EXTRA_STATIC_LIB_DIRS: ${{ steps.pyo3cfg.outputs.extra_static_lib_dirs }}
           DW_FROZEN_STDLIB_DIR: ${{ steps.freeze.outputs.frozen_dir }}
-        run: cargo build --release --workspace
-
-      - name: Verify libpython is not a dynamic dependency (Linux)
-        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          echo "---- ldd target/release/dw ----"
-          ldd target/release/dw || true
-          if ldd target/release/dw | grep -qi python; then
-            echo "::error::dw still dynamically links against libpython; static linking did not take effect"
-            exit 1
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Windows already searches the executable's own directory for
+            # DLLs by default; the ELF equivalent needs an explicit rpath,
+            # or dw would only find libpython*.so sitting right next to it
+            # via LD_LIBRARY_PATH -- inconvenient and easy to forget,
+            # unlike Windows' "just works" default. $ORIGIN is a literal
+            # token the dynamic linker substitutes at load time (the
+            # directory containing the running executable); it must reach
+            # the linker unexpanded, hence the single quotes.
+            export RUSTFLAGS='-C link-args=-Wl,-rpath,$ORIGIN'
           fi
-          echo "OK: no dynamic libpython dependency"
+          cargo build --release --workspace
 
-      - name: Report the python DLL dependency (Windows, informational)
-        if: runner.os == 'Windows'
-        run: |
-          set -euo pipefail
-          echo "dw.exe is dynamically linked against $(basename "${{ steps.pyo3cfg.outputs.dll }}")"
-          echo "(python-build-standalone's Windows build doesn't support the"
-          echo "fully-static embedding Linux gets -- see README.)"
-          DUMPBIN=$(find "/c/Program Files/Microsoft Visual Studio" -iname dumpbin.exe 2>/dev/null | grep -i hostx64/x64 | head -n1 || true)
-          if [ -n "$DUMPBIN" ]; then
-            echo "---- dumpbin /dependents ----"
-            "$DUMPBIN" /dependents target/release/dw.exe || true
-          fi
-
-      - name: Smoke test in total isolation (no companion files, no env vars)
+      - name: Smoke test in total isolation (binary + its Python shared library only)
         run: |
           set -euo pipefail
           EXE_NAME=dw
           [ "$RUNNER_OS" = "Windows" ] && EXE_NAME=dw.exe
           # The whole point of freezing the stdlib in: no Lib/ or
-          # python-runtime/ directory needed, no PYTHONHOME/PYTHONPATH, not
-          # even run from the repo checkout. Copy *only* the binary (plus,
-          # on Windows, its required pythonXY.dll -- see the step above) and
-          # the input/script into an empty directory elsewhere and run it
-          # from there with a scrubbed environment.
+          # lib/pythonX.Y/ directory needed, no PYTHONHOME/PYTHONPATH, not
+          # even run from the repo checkout. Copy *only* the binary, the
+          # one Python shared library/DLL it depends on, and the
+          # input/script into an empty directory elsewhere, then run it
+          # from there with a scrubbed environment -- deliberately *not*
+          # setting LD_LIBRARY_PATH on Linux, since finding the library via
+          # the rpath set above (i.e. with zero configuration, the same as
+          # Windows finding the DLL next to the exe) is exactly what this
+          # step is meant to prove.
           ISOLATED=$(mktemp -d)
           cp "target/release/$EXE_NAME" "$ISOLATED/$EXE_NAME"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cp "${{ steps.pyo3cfg.outputs.dll }}" "$ISOLATED/"
-          fi
+          cp "${{ steps.pyo3cfg.outputs.pylib }}" "$ISOLATED/"
           cp examples/sample.csv examples/transform_example.py "$ISOLATED/"
           ls -la "$ISOLATED"
           cd "$ISOLATED"
           env -i PATH=/usr/bin:/bin \
             "./$EXE_NAME" --input sample.csv --script transform_example.py
 
-      - name: Package artifact
+      - name: Package artifact (binary + its one Python shared library)
         run: |
           set -euo pipefail
           mkdir -p dist
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp target/release/dw.exe dist/dw.exe
-            cp "${{ steps.pyo3cfg.outputs.dll }}" dist/
+            cp "${{ steps.pyo3cfg.outputs.pylib }}" dist/
             (cd dist && 7z a "$GITHUB_WORKSPACE/dw-${{ matrix.triple }}.zip" .)
           else
             cp target/release/dw dist/dw
-            tar -C dist -czf dw-${{ matrix.triple }}.tar.gz dw
+            cp "${{ steps.pyo3cfg.outputs.pylib }}" dist/
+            tar -C dist -czf dw-${{ matrix.triple }}.tar.gz .
           fi
 
       - uses: actions/upload-artifact@v4

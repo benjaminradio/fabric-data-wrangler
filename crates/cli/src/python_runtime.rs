@@ -34,30 +34,37 @@
 //! intermediate file.
 //!
 //! **Interpreter linking.** `pyo3`'s build script (`pyo3-build-config`)
-//! decides which libpython to link against from `PYO3_CONFIG_FILE` (or
+//! decides which Python library to link against from `PYO3_CONFIG_FILE` (or
 //! `PYO3_PYTHON`, or a `python3` found on `PATH`) at *build* time -- no
 //! code here changes between a system-Python dev build and a CI build
-//! statically linked against a `python-build-standalone` distribution. See
-//! `.github/workflows/build.yml`, which downloads a `python-build-standalone`
-//! release, points `PYO3_CONFIG_FILE` at its static `libpython*.a`, and
-//! verifies with `ldd` that the resulting binary has no dynamic dependency
-//! on libpython. A local `cargo build` without that env var still falls
-//! back to the system's libpython via `auto-initialize`, for convenience.
+//! linked against a `python-build-standalone` distribution.
+//! `.github/workflows/build.yml` builds `dw` on both Linux and Windows
+//! dynamically linked against that distribution's Python shared
+//! library/DLL, and ships it alongside the binary as one extra file --
+//! this was originally attempted as a fully static build on Linux, but
+//! since Windows has no equivalent static option in python-build-standalone
+//! (only a DLL), unifying both platforms around "binary + one shared
+//! library" removed a whole static-linking-specific subsystem (discovering
+//! and linking the several extra native libs that statically-compiled
+//! stdlib extensions need) for a real simplification, not just consistency
+//! for its own sake.
 //!
-//! **Stdlib, frozen into the binary.** Even with libpython statically
-//! linked, the pure-Python standard library (`.py` sources) still has to
-//! come from *somewhere* at run time. Rather than shipping those files on
-//! disk beside the binary, `.github/workflows/build.yml` runs
-//! `scripts/freeze_stdlib.py` (with the *same* interpreter whose libpython
-//! is linked in, so bytecode compatibility is guaranteed) to compile every
-//! stdlib module to marshalled bytecode, and `build.rs` embeds the result
-//! into the binary via `include_bytes!`. `install_frozen_stdlib` below
-//! registers those modules as CPython "frozen modules" -- the same
-//! mechanism CPython itself uses to embed `importlib._bootstrap` -- by
-//! prepending them to `PyImport_FrozenModules` before the interpreter
-//! initializes. `FrozenImporter` is always the first entry on
-//! `sys.meta_path`, so every one of these imports is satisfied before
-//! CPython (or a transformation script) ever consults the filesystem. A
+//! **Stdlib, frozen into the binary regardless.** Dynamic linking of the
+//! Python library itself doesn't affect this: the pure-Python standard
+//! library (`.py` sources) still has to come from *somewhere* at run time,
+//! and shipping those files on disk beside the binary is exactly the
+//! per-platform companion-directory problem this project set out to avoid.
+//! `.github/workflows/build.yml` runs `scripts/freeze_stdlib.py` (with the
+//! *same* interpreter whose library is linked in, so bytecode compatibility
+//! is guaranteed) to compile every stdlib module to marshalled bytecode,
+//! and `build.rs` embeds the result into the binary via `include_bytes!`.
+//! `install_frozen_stdlib` below registers those modules as CPython "frozen
+//! modules" -- the same mechanism CPython itself uses to embed
+//! `importlib._bootstrap` -- by prepending them to `PyImport_FrozenModules`
+//! before the interpreter initializes. `FrozenImporter` is always the first
+//! entry on `sys.meta_path`, so every one of these imports is satisfied
+//! before CPython (or a transformation script) ever consults the
+//! filesystem. A
 //! local dev build (system libpython, no frozen stdlib generated) leaves
 //! `FROZEN_STDLIB_ENTRIES` empty and this is a no-op, falling back to
 //! the system's normal on-disk stdlib.

@@ -1,45 +1,16 @@
-//! Two build-time-only jobs, both no-ops for a local dev build against the
-//! system's dynamically-linked libpython (the env vars they read are only
-//! set by `.github/workflows/build.yml`):
-//!
-//! 1. **Extra static libs.** Statically-linked python-build-standalone
-//!    distributions compile several stdlib extension modules (`_bz2`,
-//!    `_ctypes`, `_ssl`, ...) directly into `libpython*.a` rather than as
-//!    separate `.so`s, but those modules still depend on *their* own native
-//!    libraries (`libbz2.a`, `libffi.a`, ...), which pyo3-build-config's own
-//!    build script doesn't know to link. CI discovers whichever such
-//!    libraries ship alongside the chosen distribution and passes them here.
-//!
-//! 2. **Frozen stdlib.** Generates the Rust glue (a byte blob plus an entry
-//!    table) that `python_runtime.rs` uses to register the pure-Python
-//!    standard library as CPython "frozen modules" -- compiled directly into
-//!    the binary, needing no file on disk at run time. See
-//!    `scripts/freeze_stdlib.py`, which produces the blob/manifest this
-//!    reads.
+//! Generates the Rust glue (a byte blob plus an entry table) that
+//! `python_runtime.rs` uses to register the pure-Python standard library as
+//! CPython "frozen modules" -- compiled directly into the binary, needing
+//! no file on disk at run time. See `scripts/freeze_stdlib.py`, which
+//! produces the blob/manifest this reads. A no-op (empty tables) for a
+//! local dev build, where `DW_FROZEN_STDLIB_DIR` isn't set; only
+//! `.github/workflows/build.yml` sets it.
 
 use std::env;
 use std::fmt::Write as _;
 use std::path::Path;
 
 fn main() {
-    link_extra_static_libs();
-    generate_frozen_stdlib_glue();
-}
-
-fn link_extra_static_libs() {
-    if let Ok(dirs) = env::var("DW_EXTRA_STATIC_LIB_DIRS") {
-        for dir in dirs.lines().map(str::trim).filter(|s| !s.is_empty()) {
-            println!("cargo:rustc-link-search=native={dir}");
-        }
-    }
-    if let Ok(libs) = env::var("DW_EXTRA_STATIC_LIBS") {
-        for lib in libs.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            println!("cargo:rustc-link-lib=static={lib}");
-        }
-    }
-}
-
-fn generate_frozen_stdlib_glue() {
     println!("cargo:rerun-if-env-changed=DW_FROZEN_STDLIB_DIR");
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR set by cargo");

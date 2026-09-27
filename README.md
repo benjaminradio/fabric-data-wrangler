@@ -152,11 +152,11 @@ cargo build --release
 ```
 
 **CI build** (`.github/workflows/build.yml`, runs on every push): downloads
-a `python-build-standalone` distribution, statically links its
-`libpython*.a` in, and freezes the standard library into the binary as
-bytecode — a true single-file `dw` with no system Python needed to build
-it and nothing else needed alongside it to run it. See "True single-binary
-embedding, via CI" below for how it works and what it produces.
+a `python-build-standalone` distribution, dynamically links its Python
+shared library/DLL in, and freezes the standard library into the binary as
+bytecode — no system Python needed to build it, and nothing beyond that
+one shared library file needed alongside it to run it. See "Embedded
+Python via CI" below for how it works and what it produces.
 
 ### Output formats
 
@@ -166,99 +166,104 @@ call in the script writes immediately: multiple calls each print their own
 block to stdout, or overwrite the same `--output` file in turn (last call
 wins).
 
-## True single-binary embedding, via CI
+## Embedded Python via CI
 
 `.github/workflows/build.yml` runs on every push, as a matrix over
 `ubuntu-latest` (`x86_64-unknown-linux-gnu`) and `windows-latest`
 (`x86_64-pc-windows-msvc`), and produces a `dw`/`dw.exe` binary with
-Python fully embedded: no system Python needed to build it, no
-`libpython.so`/`pythonXY.dll` dependency to run it, and — the part that
-makes it an actual single file — **no companion directory for the
-standard library either**. Both platforms share one script (Windows
-runners ship Git Bash, so the whole job runs under `shell: bash`), which
-branches only where the two genuinely differ (library/executable naming,
-stdlib directory layout — POSIX's `lib/pythonX.Y/` vs. Windows' `Lib/`
-directly under the install prefix). For each platform, it:
+Python embedded: no system Python needed to build it, and **no separate
+directory for the standard library needed to run it** — just the binary
+plus the one Python shared library/DLL it dynamically links against,
+shipped side by side, the same way any program ships a runtime dependency.
+Both platforms share one script (Windows runners ship Git Bash, so the
+whole job runs under `shell: bash`), branching only where the two
+genuinely differ (library/executable naming, stdlib directory layout —
+POSIX's `lib/pythonX.Y/` vs. Windows' `Lib/` directly under the install
+prefix). For each platform, it:
 
 1. Resolves the latest (or a pinned) `astral-sh/python-build-standalone`
-   release for CPython 3.11 / the target triple, preferring an optimized
-   "full" build and falling back through a few variant names if a given
-   one isn't published for that triple.
+   release's **`install_only`** asset for CPython 3.11 / the target
+   triple — the plain, standard redistributable-runtime flavor (what
+   `pyenv`/`uv`/etc. use under the hood), not the more complex
+   build-artifact-bearing "full" flavor.
 2. Generates a `pyo3-build-config` file pointing `PYO3_CONFIG_FILE` at that
-   distribution's static Python lib (`libpython*.a` on Linux,
-   `python3*.lib` on Windows; `shared=false`), instead of letting pyo3
-   auto-discover a system interpreter.
-3. Discovers whichever other static libs the distribution bundles for its
-   statically-compiled stdlib C extensions (`libbz2`, `libffi`, etc. —
-   `_bz2`, `_ctypes`, `_ssl`, and others get compiled *into* the Python lib
-   itself in a static build, but still reference symbols from those
-   libraries) and passes them to `crates/cli/build.rs`, which emits the
-   matching `cargo:rustc-link-lib=static=...` directives.
-4. Runs `scripts/freeze_stdlib.py`, using *that exact downloaded
+   distribution's Python link library (`libpython*.so` on Linux,
+   the `python3*.lib` import library on Windows; `shared=true`), instead
+   of letting pyo3 auto-discover a system interpreter.
+3. Runs `scripts/freeze_stdlib.py`, using *that exact downloaded
    interpreter*, to compile every pure-Python stdlib module to marshalled
    bytecode and pack it into one blob + manifest.
-5. Builds `dw`. `crates/cli/build.rs` embeds that blob via `include_bytes!`
-   and generates a small entry table; `python_runtime.rs`'s
-   `install_frozen_stdlib` registers every module in it as a CPython
-   **frozen module** — the exact mechanism CPython itself already uses to
-   embed `importlib._bootstrap` — by prepending them to
+4. Builds `dw`, with an rpath (`-Wl,-rpath,$ORIGIN`) on Linux so it finds
+   a Python shared library placed next to it with zero configuration —
+   the ELF equivalent of Windows already searching the executable's own
+   directory for DLLs by default. `crates/cli/build.rs` embeds the frozen
+   stdlib blob via `include_bytes!` and generates a small entry table;
+   `python_runtime.rs`'s `install_frozen_stdlib` registers every module in
+   it as a CPython **frozen module** — the exact mechanism CPython itself
+   already uses to embed `importlib._bootstrap` — by prepending them to
    `PyImport_FrozenModules` before the interpreter initializes.
    `FrozenImporter` is always first on `sys.meta_path`, so `encodings`,
    `io`, and everything else the interpreter needs at startup — and
    anything a transformation script imports — resolves from memory before
-   the filesystem is ever consulted. All of steps 3–4 are no-ops locally
-   (the env vars they read are only set in CI), so a normal dev build
-   against a system interpreter is unaffected. None of this Rust code is
-   platform-specific; `pyo3-build-config`/`pyo3::ffi` are what make the
-   same source work against either target.
-6. **Verifies there's no dynamic dependency on the Python library**: `ldd`
-   on Linux (confirmed: only `libc`, `libm`, `libgcc_s`, and the dynamic
-   linker remain), `dumpbin /dependents` on Windows where available
-   (informational — the isolation test below is the authoritative check).
-7. **Smoke-tests in total isolation**: copies *only* the binary plus a
-   sample input/script into an empty temp directory elsewhere (no
-   `python-runtime/`/`Lib/`, no repo checkout) and runs it there with a
-   fully scrubbed environment (`env -i`, no `PYTHONHOME`/`PYTHONPATH`) —
-   proving it's genuinely self-contained, not just "works when some
-   environment variable happens to be set right."
-8. Packages **the binary alone** (`.tar.gz` on Linux, `.zip` on Windows)
-   and uploads it as a build artifact.
+   the filesystem is ever consulted. Step 3's env var is only set in CI, so
+   a normal dev build against a system interpreter is unaffected. None of
+   this Rust code is platform-specific; `pyo3-build-config`/`pyo3::ffi` are
+   what make the same source work against either target.
+5. **Smoke-tests in total isolation**: copies *only* the binary, its one
+   Python shared library, and a sample input/script into an empty temp
+   directory elsewhere (no `Lib/`/`lib/pythonX.Y/`, no repo checkout) and
+   runs it there with a fully scrubbed environment (`env -i`, no
+   `PYTHONHOME`/`PYTHONPATH`, and — on Linux — no `LD_LIBRARY_PATH` either,
+   which is exactly what step 4's rpath is there to make unnecessary) —
+   proving the only thing `dw` needs is that one file sitting next to it.
+6. Packages **the binary plus that one shared library** (`.tar.gz` on
+   Linux, `.zip` on Windows) and uploads it as a build artifact.
 
-**Windows is new and less battle-tested than Linux here**: this project's
-sandbox has no Windows/MSVC toolchain to develop or verify against
-locally, so unlike the Linux path (which went through several real
-CI-driven fixes before it worked — see the git history), the Windows job
-is a best-effort first pass, validated only by whatever the CI runs
-themselves show. If it needs another round of fixes (MSVC has its own
-static-vs-import-library and CRT-linkage subtleties that differ from
-Linux's `.a` static archives), check the latest Actions run for that
-branch.
+This design went through a real pivot worth knowing about: an earlier
+version tried to *statically* link libpython on Linux (a true single
+file, no companion library at all), which worked but needed its own
+subsystem — discovering and linking the several extra native static libs
+(`libbz2`, `libffi`, ...) that statically-compiled stdlib C extensions
+depend on. Windows turned out to have no equivalent static option in
+python-build-standalone at all (linking against its "static" lib failed
+with dozens of unresolved core CPython API symbols — only the DLL
+actually defines them), so `dw.exe` was always going to ship with a
+companion DLL regardless. Once Windows already needed that, doing the
+same on Linux removed the whole extra-static-libs subsystem for a real
+simplification, not just cross-platform consistency for its own sake —
+see the git history for both the static-Linux and dynamic-Windows
+attempts this replaced.
 
-pyo3 itself needed one nudge along the way: it refuses to build with the
-`auto-initialize` feature against a statically-embeddable Python
-("Embedding the Python interpreter statically does not yet have
-first-class support in PyO3... disable the auto-initialize feature").
-`crates/cli/src/python_runtime.rs` calls `pyo3::prepare_freethreaded_python()`
-explicitly instead — the same thing `auto-initialize` did implicitly, and
-it works identically against a dynamically-linked system libpython, so
-local dev builds are unaffected.
+**Windows is newer and less battle-tested than Linux here**: this
+project's sandbox has no Windows/MSVC toolchain to develop or verify
+against locally, so unlike the Linux path (iterated against several real
+CI failures before landing here — see the git history), the Windows job
+has had fewer rounds of real validation. If it needs another fix, check
+the latest Actions run for this branch.
+
+pyo3 itself needed one nudge along the way, back when Linux was still
+statically linked: it refuses to build with the `auto-initialize` feature
+against a statically-embeddable Python. `crates/cli/src/python_runtime.rs`
+calls `pyo3::prepare_freethreaded_python()` explicitly instead — the same
+thing `auto-initialize` did implicitly, and it works identically against
+today's dynamically-linked library (or a system one, for local dev), so
+this needed no further change when Linux switched to dynamic linking too.
 
 None of this needed the `littlepandas`/`display` injection mechanism to
-change at all — freezing the stdlib and swapping the linked interpreter are
-both build-environment changes, layered underneath that mechanism rather
-than through it.
+change at all — freezing the stdlib and choosing how the interpreter links
+are both build-environment changes, layered underneath that mechanism
+rather than through it.
 
 **Known remaining gap:** the freeze script compiles every pure-Python
-stdlib module it finds under the distribution's `lib/pythonX.Y/` (skipping
-`test`/`tests`/`lib2to3`/`site-packages`), and essentially all commonly-used
-C-extension modules come pre-compiled as interpreter builtins in a
-`python-build-standalone` static build (confirmed by the extra-static-libs
-step above — `_bz2`, `_ctypes`, etc. are already linked in, not loaded from
-`.so` files). An obscure extension module that a *different*
-python-build-standalone build variant ships as a separate `lib-dynload/*.so`
-rather than a builtin would still need that file on disk; none of this
-project's own code (the `littlepandas` drop-in, the CLI itself) hits that case,
-but a transformation script importing something unusual might. Widening the
+stdlib module it finds under the distribution's `lib/pythonX.Y/`/`Lib/`
+(skipping `test`/`tests`/`lib2to3`/`site-packages`). Most C-extension
+modules (`_socket`, `itertools`, etc.) are interpreter builtins in a
+python-build-standalone distribution regardless of flavor, so they're
+already inside the shared library/DLL dw links against; a handful ship as
+separate `lib-dynload/*.so` (Linux) files instead, which would need that
+file on disk if imported. None of this project's own code (the
+`littlepandas` drop-in, the CLI itself) hits that case, but a
+transformation script importing something unusual might. Widening the
 freeze coverage or handling that fallback is future work if it comes up.
 
 ## What's deliberately out of scope for v1
