@@ -1,23 +1,28 @@
 //! Embeds the Python interpreter and runs a user transformation script that
-//! looks exactly like a Fabric notebook cell:
+//! looks like a Fabric notebook cell:
 //!
 //! ```python
-//! df = pd.DataFrame(data)
+//! import littlepandas as pd
+//!
+//! df = pd.DataFrame()
 //! ...
 //! display(df)
 //! ```
 //!
-//! `data` and `display` are injected as globals (mirroring how a Fabric
-//! notebook already has `data`-producing cells and a built-in `display()`
-//! before your cell runs), and `import pandas as pd` resolves to our
-//! pure-Python drop-in (`crates/cli/src/python/pandas/__init__.py`)
-//! installed into `sys.modules["pandas"]`. In a real Fabric notebook, real
-//! pandas is already installed, so that same `import pandas as pd` line
-//! resolves to the genuine library instead -- the transformation code does
-//! not change at all; only how `data` gets populated differs.
+//! `display` is injected as a global (mirroring Fabric's own notebook
+//! built-in), and `import littlepandas as pd` resolves to our pure-Python
+//! drop-in (`crates/cli/src/python/littlepandas/__init__.py`), installed
+//! into `sys.modules["littlepandas"]`. Unlike an earlier version of this
+//! project, that module is deliberately *not* named or installed as
+//! `pandas` -- it isn't pandas, and hiding that behind an identical import
+//! would make a script's actual data source invisible. Porting to Fabric
+//! is a small, visible two-line diff instead: the import name, and
+//! `pd.DataFrame()` (which pulls in `--input` locally -- see
+//! `_INGESTED_DATA` below and the module's own docstring) becoming
+//! `pd.DataFrame(<real data source>)`.
 //!
-//! **No disk writes for embedding Python.** The `pandas` drop-in's source
-//! is compiled into the binary at build time via `include_str!` and
+//! **No disk writes for embedding Python.** The `littlepandas` drop-in's
+//! source is compiled into the binary at build time via `include_str!` and
 //! installed into `sys.modules` directly from that in-memory string -- it
 //! is never extracted to a temp directory or shipped as a loose file beside
 //! the binary. The user's transformation script is read from disk (a
@@ -64,7 +69,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 
-const PANDAS_DROPIN_PY: &str = include_str!("python/pandas/__init__.py");
+const LITTLEPANDAS_DROPIN_PY: &str = include_str!("python/littlepandas/__init__.py");
 
 include!(concat!(env!("OUT_DIR"), "/frozen_stdlib_generated.rs"));
 
@@ -136,14 +141,17 @@ pub enum OutputTarget {
     File(PathBuf, OutputFormat),
 }
 
-fn install_pandas_dropin(py: Python<'_>) -> PyResult<()> {
+/// Install the `littlepandas` drop-in into `sys.modules` and return the
+/// module object, so the caller can set `_INGESTED_DATA` on it before
+/// running the transformation script.
+fn install_littlepandas_dropin<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
     let sys_modules = py.import_bound("sys")?.getattr("modules")?;
     let types = py.import_bound("types")?;
-    let module = types.call_method1("ModuleType", ("pandas",))?;
+    let module = types.call_method1("ModuleType", ("littlepandas",))?;
 
     let locals = PyDict::new_bound(py);
-    locals.set_item("src", PANDAS_DROPIN_PY)?;
-    locals.set_item("name", "pandas")?;
+    locals.set_item("src", LITTLEPANDAS_DROPIN_PY)?;
+    locals.set_item("name", "littlepandas")?;
     let compiled = py.eval_bound("compile(src, name, 'exec')", None, Some(&locals))?;
 
     let exec_locals = PyDict::new_bound(py);
@@ -151,8 +159,8 @@ fn install_pandas_dropin(py: Python<'_>) -> PyResult<()> {
     exec_locals.set_item("module", &module)?;
     py.eval_bound("exec(compiled, module.__dict__)", None, Some(&exec_locals))?;
 
-    sys_modules.set_item("pandas", &module)?;
-    Ok(())
+    sys_modules.set_item("littlepandas", &module)?;
+    Ok(module)
 }
 
 fn write_target(records: &[Record], target: &OutputTarget) -> Result<()> {
@@ -263,10 +271,10 @@ fn sibling_python_runtime_dir() -> Option<PathBuf> {
     candidate.is_dir().then_some(candidate)
 }
 
-/// Read `records` in as the `data` global, then run the user's
-/// transformation script as top-level code (like a notebook cell): it
-/// builds a DataFrame from `data`, transforms it, and calls `display(df)`
-/// zero or more times to produce output.
+/// Make `records` available to `littlepandas.DataFrame()` (no arguments)
+/// via `_INGESTED_DATA`, then run the user's transformation script as
+/// top-level code (like a notebook cell): it builds a DataFrame, transforms
+/// it, and calls `display(df)` zero or more times to produce output.
 pub fn run_script(
     script_path: &Path,
     records: Vec<Record>,
@@ -289,14 +297,15 @@ pub fn run_script(
     pyo3::prepare_freethreaded_python();
 
     Python::with_gil(|py| -> Result<()> {
-        install_pandas_dropin(py).map_err(|e| anyhow!("installing pandas drop-in: {e}"))?;
-
-        let globals = PyDict::new_bound(py);
-        globals.set_item("__name__", "__main__")?;
+        let littlepandas = install_littlepandas_dropin(py)
+            .map_err(|e| anyhow!("installing littlepandas drop-in: {e}"))?;
 
         let py_data = pythonize::pythonize(py, &records)
             .map_err(|e| anyhow!("converting input records to Python: {e}"))?;
-        globals.set_item("data", py_data)?;
+        littlepandas.setattr("_INGESTED_DATA", py_data)?;
+
+        let globals = PyDict::new_bound(py);
+        globals.set_item("__name__", "__main__")?;
 
         let display_fn = make_display_fn(py, output)
             .map_err(|e| anyhow!("building display() function: {e}"))?;

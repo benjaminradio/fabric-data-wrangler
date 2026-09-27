@@ -1,9 +1,8 @@
 # dw — local data-wrangling CLI
 
 Offline CLI for wrangling small CSV/XLSX datasets (< ~10k rows) with plain
-Python transformation scripts written exactly like a Fabric notebook cell —
-`import pandas as pd`, `df = pd.DataFrame(data)`, ..., `display(df)` — so the
-same script cuts and pastes unmodified into a real Fabric notebook later.
+Python transformation scripts that look like a Fabric notebook cell —
+`import littlepandas as pd`, `df = pd.DataFrame()`, ..., `display(df)`.
 
 ```
 dw --input data.csv --script transform.py --output out.csv
@@ -12,9 +11,9 @@ dw --input data.csv --script transform.py --output out.csv
 `transform.py`:
 
 ```python
-import pandas as pd
+import littlepandas as pd
 
-df = pd.DataFrame(data)
+df = pd.DataFrame()
 df = df[df["units"].notna()]
 summary = df.groupby("region", as_index=False).agg(total=("units", "sum"))
 display(summary)
@@ -23,30 +22,51 @@ display(summary)
 See `examples/transform_example.py` and `examples/sample.csv` for a working
 example.
 
+## `littlepandas`, not `pandas`
+
+This project ships a small, pure-Python DataFrame drop-in
+(`crates/cli/src/python/littlepandas/__init__.py`) so transformation
+scripts can be written in pandas-shaped code without needing real
+pandas/numpy embedded (see "Why no real pandas/numpy locally" below). An
+earlier version of this project installed that drop-in *as* `sys.modules["pandas"]`,
+so `import pandas as pd` resolved to it locally and to the real thing in
+Fabric, with no script changes at all. That's tidy, but it hides something
+important: a script's `import pandas` would silently mean two completely
+different libraries depending on where it runs, with no visible marker of
+that fact in the code itself.
+
+So the drop-in is named, and installed as, `littlepandas` instead — `import
+littlepandas as pd` only ever resolves locally. Porting a script to a real
+Fabric notebook is consequently a small, *visible* two-line diff rather
+than a silent swap:
+
+1. `import littlepandas as pd` → `import pandas as pd`.
+2. `df = pd.DataFrame()` → `df = pd.DataFrame(<real data source>)`, e.g. a
+   lakehouse table read.
+
+**`pd.DataFrame()` with no arguments pulls in the CLI's `--input` data.**
+This is deliberate and deliberately not how real pandas behaves: calling
+`pandas.DataFrame()` with no arguments doesn't error, but it does give you
+a genuinely empty frame (verified — the resulting `display()` prints an
+empty table, not a crash), so a bare `pd.DataFrame()` left unported into
+Fabric fails loudly-ish (empty output) rather than silently doing the
+right thing. That's the point: it's a visible flag for "this line needs a
+real data source before it means anything outside this CLI," which you
+want to be unable to miss.
+
 ## How the cut-and-paste contract works
 
-A script like the one above needs exactly two things to exist that it
-didn't create itself: a `data` variable and a `display()` function. Those
-are exactly what a Fabric notebook already gives you — an earlier cell
-populates `data` (e.g. from a lakehouse read), and `display()` is a Fabric
-built-in. Locally, the `dw` CLI supplies both:
-
-- **`data`** — the input CSV/XLSX, ingested host-side in Rust (`csv` /
-  `calamine` crates, no Python involved) and injected as a global: a plain
-  `list[dict]`, exactly the shape `pd.DataFrame(data)` expects and exactly
-  the shape you'd get back from most Fabric ingestion paths too.
-- **`import pandas as pd`** — resolves to this project's pure-Python
-  drop-in (`crates/cli/src/python/pandas/__init__.py`), installed into
-  `sys.modules["pandas"]` before the script runs. In a Fabric notebook, real
-  pandas is already installed, so the identical import line resolves to the
-  genuine library instead. **This one line is the entire portability
-  contract** — nothing else in the script needs an adapter or a different
-  import path.
-- **`display(df)`** — locally, a native Rust function writes the
-  DataFrame's rows (via `.to_dict(orient="records")`, called on whatever is
-  passed — real pandas DataFrames included) to CSV/XLSX/NDJSON/table, to
-  stdout or `--output`. In Fabric, `display()` renders the DataFrame in the
-  notebook instead; the call is a no-op difference either way.
+- **`littlepandas.DataFrame()`** — the Rust host ingests `--input`
+  host-side (`csv`/`calamine` crates, no Python involved) and, before
+  running the script, sets it on the `littlepandas` module as
+  `_INGESTED_DATA`. `DataFrame()` called with no arguments reads from
+  there; called with an explicit argument (`pd.DataFrame(some_list)`) it
+  behaves like an ordinary constructor, same as real pandas.
+- **`display(df)`** — a native Rust function that writes the DataFrame's
+  rows (via `.to_dict(orient="records")`, called on whatever is passed —
+  a real pandas DataFrame included) to CSV/XLSX/NDJSON/table, to stdout or
+  `--output`. In Fabric, `display()` is already a notebook built-in with
+  the same name; the call itself needs no change either way.
 
 ## Architecture
 
@@ -55,15 +75,16 @@ built-in. Locally, the `dw` CLI supplies both:
   and consumes plain `Vec<IndexMap<String, serde_json::Value>>` records.
 - **`crates/cli`** — the `dw` binary. Parses arguments (`clap`), embeds a
   Python interpreter (`pyo3`), and:
-  1. Installs the `pandas` drop-in into `sys.modules` directly from
+  1. Installs the `littlepandas` drop-in into `sys.modules` directly from
      `include_str!`-embedded source — no temp-directory extraction, no
      files shipped beside the binary.
-  2. Sets `data` (the ingested records, converted via `pythonize`) and a
-     native `display()` closure as globals.
+  2. Sets the ingested records (converted via `pythonize`) as
+     `littlepandas._INGESTED_DATA`, and a native `display()` closure as a
+     script global.
   3. Reads the user's `.py` script from disk (a legitimate input file) and
      runs it as top-level code via `Python::run_bound` — never written to a
      temp file.
-- **`crates/cli/src/python/pandas/__init__.py`** — the pure-Python
+- **`crates/cli/src/python/littlepandas/__init__.py`** — the pure-Python
   DataFrame/Series/GroupBy drop-in, built incrementally as real
   transformation scripts need more of it. Currently covers: column
   selection/assignment, boolean-mask filtering (`df[df["x"] > 5]`),
@@ -71,7 +92,9 @@ built-in. Locally, the `dw` CLI supplies both:
   `groupby(...).agg(...)` using pandas' named-aggregation tuple shorthand
   (`total=("col", "sum")`) plus `.sum()`/`.mean()`/`.count()`/`.size()`,
   `merge` (inner/left, `on` or `left_on`/`right_on`, suffix handling),
-  `drop_duplicates`, `head`/`tail`, `to_dict(orient="records")`.
+  `drop_duplicates`, `head`/`tail`, `melt` (wide→long), `pivot`
+  (long→wide, no aggregation), module-level `concat` (row-wise stacking,
+  union of columns), `to_dict(orient="records")`.
 
 ## Why no real pandas/numpy locally
 
@@ -87,8 +110,8 @@ records instead, mirroring only the pandas surface area actually used.
 
 ## Known compatibility gaps
 
-This is a subset of pandas, not a reimplementation, and it's missing a real
-**Index**. Concretely:
+`littlepandas` is a subset of pandas' API surface, not a reimplementation,
+and it's missing a real **Index**. Concretely:
 
 - `groupby(...)` results always come back with the group-by columns as
   regular columns, as if `as_index=False` were always passed. **Always pass
@@ -103,8 +126,9 @@ This is a subset of pandas, not a reimplementation, and it's missing a real
   consistently, but code that specifically checks `math.isnan(x)` will not
   behave the same locally as on real pandas.
 - No `.loc`/`.iloc`, no multi-index, no non-`records` `to_dict` orients, no
-  `apply(axis=0)`. Add them here as real scripts need them — see the
-  drop-in's module docstring.
+  `apply(axis=0)`, no `pivot_table` (aggregating pivot — only the plain,
+  non-aggregating `pivot` exists). Add them here as real scripts need them
+  — see the drop-in's module docstring.
 
 ## Building and running
 
@@ -188,7 +212,7 @@ explicitly instead — the same thing `auto-initialize` did implicitly, and
 it works identically against a dynamically-linked system libpython, so
 local dev builds are unaffected.
 
-None of this needed the `data`/`pandas`/`display` injection mechanism to
+None of this needed the `littlepandas`/`display` injection mechanism to
 change at all — freezing the stdlib and swapping the linked interpreter are
 both build-environment changes, layered underneath that mechanism rather
 than through it.
@@ -202,7 +226,7 @@ step above — `_bz2`, `_ctypes`, etc. are already linked in, not loaded from
 `.so` files). An obscure extension module that a *different*
 python-build-standalone build variant ships as a separate `lib-dynload/*.so`
 rather than a builtin would still need that file on disk; none of this
-project's own code (the `pandas` drop-in, the CLI itself) hits that case,
+project's own code (the `littlepandas` drop-in, the CLI itself) hits that case,
 but a transformation script importing something unusual might. Widening the
 freeze coverage or handling that fallback is future work if it comes up.
 

@@ -1,15 +1,15 @@
 """Example transformation script -- looks like a Fabric notebook cell.
 
-Cut-and-paste unmodified into a Fabric notebook: there, `data` would come
-from your own ingestion cell (e.g. a lakehouse table read into a list of
-rows/dicts) and `import pandas as pd` resolves to real pandas instead of
-this project's pure-Python drop-in. `display()` is likewise already a
-Fabric notebook built-in.
+`import littlepandas as pd` and the bare `pd.DataFrame()` are the two
+local-only lines: porting to a real Fabric notebook means changing the
+import to `import pandas as pd` and giving `DataFrame()` a real data
+source (e.g. a lakehouse table read). `display()` is already a Fabric
+notebook built-in, so that line needs no change either way.
 """
 
-import pandas as pd
+import littlepandas as pd
 
-df = pd.DataFrame(data)
+df = pd.DataFrame()
 df["units"] = df["units"].fillna(0)
 df = df.astype({"units": int})
 df["revenue"] = df["units"] * df["unit_price"]

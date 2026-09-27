@@ -1,12 +1,27 @@
-"""Pure-Python drop-in for the tiny slice of the pandas API this project
-uses, built incrementally as real transformation scripts need more of it.
+"""littlepandas: a small, honestly-named, pure-Python drop-in for the tiny
+slice of the pandas API this project uses, built incrementally as real
+transformation scripts need more of it.
 
-This module is installed as ``sys.modules["pandas"]`` by the Rust host, so
-a script's ``import pandas as pd`` resolves here locally. In a Fabric
-notebook, the real pandas package is already installed, so the exact same
-``import pandas as pd`` line resolves to the genuine library instead --
-nothing about the transformation code needs to change. That import line is
-the entire portability contract.
+This is deliberately **not** called ``pandas`` and does not pretend to be
+it: it is installed as ``sys.modules["littlepandas"]`` by the Rust host, so
+a script does ``import littlepandas as pd`` -- an import that only resolves
+locally. Porting a script to a real Fabric notebook is a small, visible
+two-line diff, not a silent swap of what an unqualified ``import pandas``
+means:
+
+1. ``import littlepandas as pd`` becomes ``import pandas as pd``.
+2. ``df = pd.DataFrame()`` (see below) becomes ``df = pd.DataFrame(<real
+   data source>)``, e.g. a lakehouse read.
+
+**``pd.DataFrame()`` with no arguments pulls in the CLI's ingested input
+data.** This is intentional, and intentionally not how real pandas
+behaves (``pandas.DataFrame()`` with no arguments makes an empty frame) --
+seeing a bare ``pd.DataFrame()`` in a script is a deliberate, visible flag
+that says "this line is local-only and needs a real data source before it
+will do anything in Fabric," exactly the kind of thing you want to be
+unable to miss when porting. The Rust host sets the module-level
+``_INGESTED_DATA`` below after loading the CLI's ``--input`` file and
+before running the script.
 
 Known compatibility gap (the big one): this DataFrame has no real pandas
 Index. Operations that in real pandas move something into (or read
@@ -20,7 +35,12 @@ avoid depending on index alignment.
 
 from itertools import groupby as _itertools_groupby
 
-__all__ = ["DataFrame", "Series"]
+__all__ = ["DataFrame", "Series", "concat"]
+
+# Set by the Rust host (crates/cli/src/python_runtime.rs) after loading
+# --input and before running the transformation script. `pd.DataFrame()`
+# with no arguments reads from here -- see the module docstring above.
+_INGESTED_DATA = None
 
 
 def _is_missing(v):
@@ -160,7 +180,12 @@ class DataFrame:
     """Row-oriented (``list[dict]``) drop-in for the pandas DataFrame surface used here."""
 
     def __init__(self, data=None, columns=None):
-        rows = list(data) if data is not None else []
+        if data is None:
+            # No arguments: pull in the CLI's ingested --input data. Real
+            # pandas would give you an empty frame here instead -- see the
+            # module docstring.
+            data = _INGESTED_DATA if _INGESTED_DATA is not None else []
+        rows = list(data)
         if columns is not None:
             self._columns = list(columns)
         else:
@@ -354,6 +379,74 @@ class DataFrame:
 
     def tail(self, n=5):
         return DataFrame._from_rows(list(self._rows[-n:]) if n else [], list(self._columns))
+
+    def melt(self, id_vars=None, value_vars=None, var_name="variable", value_name="value"):
+        """Unpivot from wide to long: each ``value_vars`` column becomes a
+        row, keyed by ``id_vars``. Mirrors ``pandas.DataFrame.melt``.
+        """
+        id_vars = [id_vars] if isinstance(id_vars, str) else list(id_vars or [])
+        value_vars = (
+            [value_vars]
+            if isinstance(value_vars, str)
+            else list(value_vars) if value_vars is not None
+            else [c for c in self._columns if c not in id_vars]
+        )
+        rows = []
+        for row in self._rows:
+            base = {k: row.get(k) for k in id_vars}
+            for col in value_vars:
+                rows.append({**base, var_name: col, value_name: row.get(col)})
+        return DataFrame._from_rows(rows, id_vars + [var_name, value_name])
+
+    def pivot(self, index, columns, values):
+        """Reshape from long to wide, without aggregation. Mirrors
+        ``pandas.DataFrame.pivot``; raises if a given ``(index, columns)``
+        pair repeats, same as real pandas.
+        """
+        column_values = []
+        for row in self._rows:
+            c = row.get(columns)
+            if c not in column_values:
+                column_values.append(c)
+
+        table = {}
+        index_order = []
+        for row in self._rows:
+            idx = row.get(index)
+            col = row.get(columns)
+            if idx not in table:
+                table[idx] = {}
+                index_order.append(idx)
+            if col in table[idx]:
+                raise ValueError(
+                    f"Index contains duplicate entries for ({index}={idx!r}, {columns}={col!r}); "
+                    "cannot reshape with pivot()"
+                )
+            table[idx][col] = row.get(values)
+
+        rows = []
+        for idx in index_order:
+            out_row = {index: idx}
+            for col in column_values:
+                out_row[col] = table[idx].get(col)
+            rows.append(out_row)
+        return DataFrame._from_rows(rows, [index] + column_values)
+
+
+def concat(objs, ignore_index=False):
+    """Stack DataFrames row-wise, union-ing their columns. Mirrors
+    ``pandas.concat`` for the ``axis=0`` (row-wise) case; ``ignore_index``
+    is accepted for signature compatibility but has no effect, since this
+    drop-in never models a real Index in the first place.
+    """
+    dfs = list(objs)
+    columns = []
+    for df in dfs:
+        for c in df._columns:
+            if c not in columns:
+                columns.append(c)
+    rows = [{c: row.get(c) for c in columns} for df in dfs for row in df._rows]
+    return DataFrame._from_rows(rows, columns)
 
 
 _AGG_FUNCS = {
