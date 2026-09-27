@@ -100,7 +100,9 @@ jobs:
             # typically under an install/libs/ directory, named pythonXY.lib
             # (no "lib" prefix -- that's a Unix/MSYS convention, not MSVC's).
             STATIC_LIB=$(find pbs -iname 'python3*.lib' ! -iname '*_d.lib' | head -n1)
-            PYEXE=$(find pbs -iname 'python.exe' | head -n1)
+            # Exclude the venv module's own bundled launcher stub
+            # (Lib/venv/scripts/nt/python.exe) -- not the real interpreter.
+            PYEXE=$(find pbs -iname 'python.exe' | grep -vi '/venv/' | sort | head -n1)
           else
             STATIC_LIB=$(find pbs -name 'libpython3.*.a' | head -n1)
             PYEXE=$(find pbs -type f -path '*/install/bin/python3.*' | grep -v config | head -n1)
