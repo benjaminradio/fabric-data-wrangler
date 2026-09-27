@@ -130,27 +130,69 @@ fn make_display_fn<'py>(
     )
 }
 
-/// Point `PYTHONHOME` at a shipped runtime, if one is available, before the
+/// Point Python's home at a shipped runtime, if one is available, before the
 /// interpreter initializes. Precedence: an already-set `PYTHONHOME` wins
 /// (never override an explicit choice), then `DW_PYTHON_HOME`, then a
 /// `python-runtime/` directory sitting next to the current executable (what
 /// the CI-built bundle ships). If none of these apply, Python falls back to
 /// whatever its own build-time defaults are (the system install, for a
 /// locally built dev binary).
+///
+/// This sets both the `PYTHONHOME` env var *and* calls `Py_SetPythonHome`
+/// directly via the C API. The env var alone was not reliable for a
+/// statically-linked interpreter in practice (a static/LTO'd libpython can
+/// have already resolved its path config by the time `getenv("PYTHONHOME")`
+/// would normally be consulted, depending on exactly how/when the runtime's
+/// path-configuration step runs) -- `Py_SetPythonHome` is the API CPython's
+/// own embedding docs recommend for exactly this reason: it hands the
+/// interpreter the prefix directly rather than asking it to rediscover it
+/// from the environment.
 fn configure_python_home() {
-    if std::env::var_os("PYTHONHOME").is_some() {
-        return;
-    }
-    let home = std::env::var_os("DW_PYTHON_HOME")
+    let home = std::env::var_os("PYTHONHOME")
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os("DW_PYTHON_HOME").map(PathBuf::from))
         .or_else(sibling_python_runtime_dir);
-    if let Some(home) = home {
-        std::env::set_var("PYTHONHOME", home);
+
+    let Some(home) = home else {
+        return;
+    };
+
+    std::env::set_var("PYTHONHOME", &home);
+
+    if !set_python_home_ffi(&home) {
+        eprintln!(
+            "warning: found python-runtime at {} but could not pass it to Py_SetPythonHome \
+             (non-UTF-8 path?); falling back to the PYTHONHOME environment variable only",
+            home.display()
+        );
     }
+}
+
+/// Call `Py_SetPythonHome(Py_DecodeLocale(path))`, the pattern CPython's own
+/// embedding documentation shows for setting the interpreter's home
+/// programmatically. The decoded string is intentionally leaked: CPython
+/// stores the pointer as-is (it does not copy it) and expects it to remain
+/// valid for the life of the interpreter.
+fn set_python_home_ffi(home: &Path) -> bool {
+    let Some(home_str) = home.to_str() else {
+        return false;
+    };
+    let Ok(home_c) = std::ffi::CString::new(home_str) else {
+        return false;
+    };
+    unsafe {
+        let wide = pyo3::ffi::Py_DecodeLocale(home_c.as_ptr(), std::ptr::null_mut());
+        if wide.is_null() {
+            return false;
+        }
+        pyo3::ffi::Py_SetPythonHome(wide);
+    }
+    true
 }
 
 fn sibling_python_runtime_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
     let candidate = exe.parent()?.join("python-runtime");
     candidate.is_dir().then_some(candidate)
 }
