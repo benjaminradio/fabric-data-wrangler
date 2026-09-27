@@ -61,7 +61,9 @@ for one.
   host-side (`csv`/`calamine` crates, no Python involved) and, before
   running the script, sets it on the `littlepandas` module as
   `_INGESTED_DATA`. `read_input()` is a thin wrapper returning
-  `DataFrame(_INGESTED_DATA)`.
+  `DataFrame(_INGESTED_DATA)`. Matching pandas' own `read_csv(header=None)`,
+  `read_input(header=None)` treats the input file's first row as data
+  instead of column names, defaulting columns to integers starting at 0.
 - **`display(df)`** — a native Rust function that writes the DataFrame's
   rows (via `.to_dict(orient="records")`, called on whatever is passed —
   a real pandas DataFrame included) to CSV/XLSX/NDJSON/table, to stdout or

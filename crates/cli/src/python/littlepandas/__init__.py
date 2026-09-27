@@ -25,7 +25,9 @@ exists here -- there's no equivalent to strip out when porting, just a
 line to replace with a real read. The Rust host sets the module-level
 ``_INGESTED_DATA`` below after loading ``--input`` and before running the
 script; ``read_input()`` is a thin wrapper (`DataFrame(_INGESTED_DATA)`)
-around it.
+around it. Pass ``header=None``, matching pandas' own ``read_csv(header=
+None)``, when the input file's first row is data rather than column names;
+columns then default to integers starting at 0, same as pandas.
 
 Known compatibility gap (the big one): this DataFrame has no real pandas
 Index. Operations that in real pandas move something into (or read
@@ -43,18 +45,31 @@ __all__ = ["DataFrame", "Series", "concat", "read_input"]
 
 # Set by the Rust host (crates/cli/src/python_runtime.rs) after loading
 # --input and before running the transformation script. `read_input()`
-# reads from here -- see the module docstring above.
+# reads from here -- see the module docstring above. `_INGESTED_DATA` has
+# the first row consumed as column names; `_INGESTED_DATA_HEADERLESS` is
+# the same rows with the first row kept as ordinary data (for `header=None`).
 _INGESTED_DATA = None
+_INGESTED_DATA_HEADERLESS = None
 
 
-def read_input():
+def read_input(header="infer"):
     """Return the CLI's ingested ``--input`` data as a DataFrame.
 
     Named to match pandas' ``read_csv``/``read_excel``/etc. family. Unlike
     those, this has no real-pandas equivalent to fall back to -- porting to
     Fabric means replacing this call with whatever real ingestion fits
     there (a lakehouse read, ``pd.read_csv``, ...).
+
+    ``header=None``, matching pandas, treats the input file's first row as
+    data instead of column names; columns then default to integers
+    starting at 0, same as pandas.
     """
+    if header is None:
+        rows = _INGESTED_DATA_HEADERLESS if _INGESTED_DATA_HEADERLESS is not None else []
+        ncols = len(rows[0]) if rows else 0
+        columns = list(range(ncols))
+        data = [{i: v for i, v in enumerate(row)} for row in rows]
+        return DataFrame(data, columns=columns)
     return DataFrame(_INGESTED_DATA if _INGESTED_DATA is not None else [])
 
 

@@ -39,8 +39,10 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let records = dw_ingest::read_records(&args.input)
+    let table = dw_ingest::read_table(&args.input)
         .with_context(|| format!("reading input {}", args.input.display()))?;
+    let records = table.to_records();
+    let headerless_rows = table.to_headerless_rows();
 
     let target = if args.output == "-" {
         let format = match &args.format {
@@ -57,7 +59,7 @@ fn main() -> Result<()> {
         OutputTarget::File(path, format)
     };
 
-    python_runtime::run_script(&args.script, records, target)
+    python_runtime::run_script(&args.script, records, headerless_rows, target)
         .with_context(|| format!("running transform script {}", args.script.display()))?;
 
     Ok(())

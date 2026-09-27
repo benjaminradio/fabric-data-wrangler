@@ -75,6 +75,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use dw_ingest::{OutputFormat, Record};
+use serde_json::Value;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
@@ -191,6 +192,33 @@ fn write_target(records: &[Record], target: &OutputTarget) -> Result<()> {
     Ok(())
 }
 
+/// Read a `list[dict]` of records from Python, stringifying each dict's
+/// keys -- a headerless DataFrame (`read_input(header=None)`) has integer
+/// column names, same as real pandas' default RangeIndex columns, but
+/// output formats (CSV headers, etc.) need string column names regardless.
+fn records_from_py(records_obj: &Bound<'_, PyAny>) -> PyResult<Vec<Record>> {
+    let mut records = Vec::new();
+    for row in records_obj.iter()? {
+        let row = row?;
+        let dict = row.downcast::<PyDict>().map_err(|_| {
+            PyRuntimeError::new_err("display(): expected a dict for each record")
+        })?;
+        let mut record = Record::new();
+        for (key, value) in dict.iter() {
+            let key: String = match key.extract::<String>() {
+                Ok(s) => s,
+                Err(_) => key.str()?.to_string(),
+            };
+            let value: Value = pythonize::depythonize(&value).map_err(|e| {
+                PyRuntimeError::new_err(format!("display(): couldn't read value: {e}"))
+            })?;
+            record.insert(key, value);
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
 /// Build the native `display()` callable that a transformation script calls
 /// with a DataFrame (or anything with a pandas-shaped `to_dict(orient=...)`
 /// method, or already a plain `list[dict]`).
@@ -209,9 +237,7 @@ fn make_display_fn<'py>(
             } else {
                 df_obj
             };
-            let records: Vec<Record> = pythonize::depythonize(&records_obj).map_err(|e| {
-                PyRuntimeError::new_err(format!("display(): couldn't read records: {e}"))
-            })?;
+            let records = records_from_py(&records_obj)?;
             write_target(&records, &target)
                 .map_err(|e| PyRuntimeError::new_err(format!("display(): {e}")))
         },
@@ -281,13 +307,17 @@ fn sibling_python_runtime_dir() -> Option<PathBuf> {
     candidate.is_dir().then_some(candidate)
 }
 
-/// Make `records` available to `littlepandas.read_input()` via
-/// `_INGESTED_DATA`, then run the user's transformation script as top-level
-/// code (like a notebook cell): it reads the data, transforms it, and calls
-/// `display(df)` zero or more times to produce output.
+/// Make `records` (and `headerless_rows`, the same data with the first row
+/// kept as an ordinary row rather than consumed as column names) available
+/// to `littlepandas.read_input()`/`read_input(header=None)` via
+/// `_INGESTED_DATA`/`_INGESTED_DATA_HEADERLESS`, then run the user's
+/// transformation script as top-level code (like a notebook cell): it reads
+/// the data, transforms it, and calls `display(df)` zero or more times to
+/// produce output.
 pub fn run_script(
     script_path: &Path,
     records: Vec<Record>,
+    headerless_rows: Vec<Vec<Value>>,
     output: OutputTarget,
 ) -> Result<()> {
     let source = std::fs::read_to_string(script_path)
@@ -313,6 +343,10 @@ pub fn run_script(
         let py_data = pythonize::pythonize(py, &records)
             .map_err(|e| anyhow!("converting input records to Python: {e}"))?;
         littlepandas.setattr("_INGESTED_DATA", py_data)?;
+
+        let py_headerless = pythonize::pythonize(py, &headerless_rows)
+            .map_err(|e| anyhow!("converting headerless input rows to Python: {e}"))?;
+        littlepandas.setattr("_INGESTED_DATA_HEADERLESS", py_headerless)?;
 
         let globals = PyDict::new_bound(py);
         globals.set_item("__name__", "__main__")?;
